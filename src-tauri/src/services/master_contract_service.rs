@@ -172,7 +172,13 @@ pub fn skip_reason(ctx: &AppState, broker: &str) -> Option<String> {
         .conn()
         .ok()
         .and_then(|c| symbol::owner(&c).ok())??;
-    (owner.broker == broker && owner.rows > 0 && ctx.symbol_count() > 0).then_some(reason)
+    // The master is "loaded" when the broker's entry (Phase 1: the app's
+    // default master object) holds rows (D-S2).
+    let loaded = ctx
+        .symbols_for(broker, crate::security::crypto::DEFAULT_ACCOUNT)
+        .map(|r| !r.is_empty())
+        .unwrap_or_else(|| !ctx.symbols.is_empty());
+    (owner.broker == broker && owner.rows > 0 && loaded).then_some(reason)
 }
 
 /// Trader-facing refusal to load a stored master that is not `broker`'s.
@@ -240,8 +246,7 @@ fn emit_download(ctx: &AppState, broker: &str, status: &str, message: &str) {
     });
 }
 
-fn emit_cache_loaded(ctx: &AppState, broker: &str, started: std::time::Instant) {
-    let total = ctx.symbol_count();
+fn emit_cache_loaded(ctx: &AppState, broker: &str, total: usize, started: std::time::Instant) {
     // Rough in-memory size: the resolver keeps each row once.
     let mb = (total as f64 * 400.0) / (1024.0 * 1024.0);
     ctx.bus.publish(Event::CacheLoaded {
@@ -261,9 +266,14 @@ fn emit_cache_loaded(ctx: &AppState, broker: &str, started: std::time::Instant) 
 /// is not `broker`'s: its tokens would resolve to other instruments.
 pub async fn load_cached(ctx: &Arc<AppState>, broker: &str) -> Result<usize> {
     let started = std::time::Instant::now();
-    // Read before the stored master is: a logout or switch that clears the
+    // The signing broker's entry takes the load (D-S2); in Phase 1 that is
+    // the app's default master object itself. Read its clear generation
+    // before the stored master is: a logout or switch that clears the
     // master meanwhile keeps this load out (KEY-01).
-    let cleared = ctx.symbols.clear_generation();
+    let resolver = ctx
+        .symbols_for(broker, crate::security::crypto::DEFAULT_ACCOUNT)
+        .unwrap_or_else(|| ctx.symbols.clone());
+    let cleared = resolver.clear_generation();
     let db = ctx.sqlite.clone();
     let want = broker.to_string();
     // With the contract multipliers (crypto `contract_value`); the owner
@@ -298,13 +308,13 @@ pub async fn load_cached(ctx: &Arc<AppState>, broker: &str) -> Result<usize> {
     };
     #[cfg(test)]
     test_hooks::before_load(ctx);
-    let Some(n) = ctx.symbols.load_master_if(master, cleared) else {
+    let Some(n) = resolver.load_master_if(master, cleared) else {
         return Ok(0);
     };
     if n > 0 {
         clear_unavailable(ctx);
     }
-    emit_cache_loaded(ctx, broker, started);
+    emit_cache_loaded(ctx, broker, n, started);
     tracing::info!(
         "Loaded {} instruments for {} from the stored master",
         n,
@@ -352,7 +362,12 @@ async fn download_claimed(
 ) -> Result<usize> {
     let id = broker.id();
     let started = std::time::Instant::now();
-    let cleared = ctx.symbols.clear_generation();
+    // The signing broker's entry takes the installed master (D-S2); in
+    // Phase 1 that is the app's default master object itself.
+    let resolver = ctx
+        .symbols_for(id, crate::security::crypto::DEFAULT_ACCOUNT)
+        .unwrap_or_else(|| ctx.symbols.clone());
+    let cleared = resolver.clear_generation();
     {
         let conn = ctx.sqlite.conn()?;
         mcs::update(
@@ -410,7 +425,7 @@ async fn download_claimed(
     }
     // Stored either way; loaded into memory only if the session that asked
     // for it is still the one (a logout meanwhile cleared the master).
-    let Some(total) = ctx.symbols.load_master_if(master, cleared) else {
+    let Some(total) = resolver.load_master_if(master, cleared) else {
         return Err(AppError::Broker(
             "The broker session ended during the master contract download. Sign in to your broker again."
                 .into(),
@@ -431,7 +446,7 @@ async fn download_claimed(
         mcs::record_download(&conn, id, started.elapsed().as_secs() as i64, &stats, now)?;
     }
     emit_download(ctx, id, "success", "Successfully Downloaded");
-    emit_cache_loaded(ctx, id, started);
+    emit_cache_loaded(ctx, id, total, started);
     tracing::info!(
         "Master contract for {}: {} instruments in {:.1}s",
         id,
@@ -775,6 +790,41 @@ mod tests {
         );
         assert_eq!(ctx.symbol_count(), 0);
         assert_eq!(load_cached(ctx, "zerodha").await.unwrap(), 1);
+    }
+
+    /// D-S2 step 2: the master loads through its entry's handle while a
+    /// (fake) entry for another broker sits in the store: both sessions
+    /// stay live side by side, and the master is visible through the
+    /// signing broker's entry and the app's view.
+    #[tokio::test]
+    async fn the_master_loads_for_its_entry_beside_another_entries() {
+        let (t, zerodha, _angel) = two_brokers(ist(3, 10, 0));
+        let ctx = &t.ctx;
+        session_for(ctx, "zerodha");
+        // A (fake) second entry in the store: Phase 1 installs one at a
+        // time, the multi-session core upserts it. The store holds both.
+        ctx.broker_sessions.upsert(crate::state::BrokerSession {
+            broker_id: "angel".into(),
+            account_id: crate::security::crypto::DEFAULT_ACCOUNT.into(),
+            auth_token: crate::security::Secret::new("t"),
+            feed_token: None,
+            user_id: "AB2".into(),
+            user_name: None,
+            // Older: zerodha, signed in last, stays the default target.
+            authenticated_at: ctx.now() - chrono::Duration::hours(1),
+        });
+        assert_eq!(ctx.broker_sessions.len(), 2);
+        let zd: Arc<dyn Broker> = zerodha.clone();
+        assert_eq!(download(ctx, &zd, &AuthToken::new("t")).await.unwrap(), 1);
+        // Both entries still live side by side; the master is visible
+        // through zerodha's entry's handle and the app's view.
+        assert_eq!(ctx.broker_sessions.len(), 2);
+        assert!(ctx
+            .symbols_for("zerodha", crate::security::crypto::DEFAULT_ACCOUNT)
+            .unwrap()
+            .token("SBIN", "NSE")
+            .is_some());
+        assert_eq!(ctx.symbols.token("SBIN", "NSE").as_deref(), Some("779521"));
     }
 
     /// MC-01, the abort window: a download aborted at logout still commits

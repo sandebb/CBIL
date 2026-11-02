@@ -45,23 +45,61 @@ pub struct BrokerSession {
     pub authenticated_at: DateTime<Utc>,
 }
 
+/// One live broker session and the symbol-master handle loaded for it.
+/// In Phase 1 the handle is an alias of the app's default master object
+/// (D-S2, `MULTI_BROKER_PHASE1_RUNTIME_DESIGN.md`): one session at a time,
+/// and its master is the app's master, so the modules that hold clones of
+/// the object (strategy, scalping, sandbox, bridge, agent) see the same
+/// rows the session loads. The multi-session core installs non-default
+/// entries with their own handle (step 3).
+#[derive(Debug, Clone)]
+pub struct SessionEntry {
+    pub session: BrokerSession,
+    pub symbols: SymbolResolver,
+}
+
 /// The live broker sessions, keyed by (broker, account). Today one at a
 /// time; the multi-session core grows it to several (MULTI_BROKER_PLAN
 /// Phase 1) without touching the 77 `get_broker_session` call sites, which
 /// keep resolving the default target (the newest session).
 #[derive(Debug, Default)]
 pub struct SessionStore {
-    entries: RwLock<HashMap<(String, String), BrokerSession>>,
+    entries: RwLock<HashMap<(String, String), SessionEntry>>,
+    /// The master handle a new entry takes: the app's default master
+    /// object, set once at context assembly (Phase 1 installs one session
+    /// at a time, and its master is the app's master).
+    default_symbols: RwLock<Option<SymbolResolver>>,
 }
 
 impl SessionStore {
+    /// The default master object new entries take (the one the app's
+    /// modules hold clones of).
+    pub fn with_default_symbols(&self, symbols: SymbolResolver) {
+        *self.default_symbols.write() = Some(symbols);
+    }
+
+    fn entry_symbols(&self) -> SymbolResolver {
+        self.default_symbols.read().clone().unwrap_or_default()
+    }
+
     /// Record a session for its (broker, account), replacing any earlier
-    /// one of the same pair.
+    /// one of the same pair; a re-sign-in of the pair keeps the master the
+    /// entry already holds.
     pub fn upsert(&self, session: BrokerSession) {
-        self.entries.write().insert(
-            (session.broker_id.clone(), session.account_id.clone()),
-            session,
-        );
+        let mut entries = self.entries.write();
+        let key = (session.broker_id.clone(), session.account_id.clone());
+        match entries.get_mut(&key) {
+            Some(e) => e.session = session,
+            None => {
+                entries.insert(
+                    key,
+                    SessionEntry {
+                        session,
+                        symbols: self.entry_symbols(),
+                    },
+                );
+            }
+        }
     }
 
     /// The session of one (broker, account), if live.
@@ -69,7 +107,16 @@ impl SessionStore {
         self.entries
             .read()
             .get(&(broker.to_string(), account.to_string()))
-            .cloned()
+            .map(|e| e.session.clone())
+    }
+
+    /// The master handle of one (broker, account) entry, if live — the
+    /// per-session target of the master contract service (D-S2).
+    pub fn symbols_for(&self, broker: &str, account: &str) -> Option<SymbolResolver> {
+        self.entries
+            .read()
+            .get(&(broker.to_string(), account.to_string()))
+            .map(|e| e.symbols.clone())
     }
 
     /// Remove the session of one (broker, account).
@@ -77,6 +124,7 @@ impl SessionStore {
         self.entries
             .write()
             .remove(&(broker.to_string(), account.to_string()))
+            .map(|e| e.session)
     }
 
     /// Remove the session of one (broker, account) only when `keep`
@@ -91,14 +139,20 @@ impl SessionStore {
         let key = (broker.to_string(), account.to_string());
         entries
             .get(&key)
+            .map(|e| &e.session)
             .is_some_and(keep)
-            .then(|| entries.remove(&key))
+            .then(|| entries.remove(&key).map(|e| e.session))
             .flatten()
     }
 
     /// Every live session, newest first.
     pub fn list(&self) -> Vec<BrokerSession> {
-        let mut v: Vec<BrokerSession> = self.entries.read().values().cloned().collect();
+        let mut v: Vec<BrokerSession> = self
+            .entries
+            .read()
+            .values()
+            .map(|e| e.session.clone())
+            .collect();
         v.sort_by_key(|s| std::cmp::Reverse(s.authenticated_at));
         v
     }
@@ -117,14 +171,18 @@ impl SessionStore {
 
     /// Replace whatever is live with this one session (the
     /// single-session `set_broker_session` contract: the last set wins,
-    /// whatever its timestamp). The multi-session core installs a second
-    /// session with `upsert` without ending the first.
+    /// whatever its timestamp). The entry takes the store's default master
+    /// handle; the multi-session core installs a second session with
+    /// `upsert` without ending the first.
     pub fn replace(&self, session: BrokerSession) {
         let mut entries = self.entries.write();
         entries.clear();
         entries.insert(
             (session.broker_id.clone(), session.account_id.clone()),
-            session,
+            SessionEntry {
+                session,
+                symbols: self.entry_symbols(),
+            },
         );
     }
 
@@ -502,6 +560,11 @@ impl AppState {
             bridge,
             ..
         } = p;
+        let broker_sessions = Arc::new(SessionStore::default());
+        // New session entries take the app's default master object, the
+        // same one the strategy, scalping, sandbox, bridge and agent hold
+        // clones of (D-S2).
+        broker_sessions.with_default_symbols(symbols.clone());
         Self {
             historify,
             strategy,
@@ -529,7 +592,7 @@ impl AppState {
             sessions: WebSessionStore::new(),
             limiter: RateLimiter::new(),
             api_keys: ApiKeyCache::new(),
-            broker_sessions: Arc::new(SessionStore::default()),
+            broker_sessions,
             session_account: Default::default(),
             revoke_pending: Mutex::new(None),
             session_switch: tokio::sync::Mutex::new(()),
@@ -790,12 +853,20 @@ impl AppState {
 
     /// Install a session (replacing whatever is live — the last set wins,
     /// as before), or end every live session when `None` (app sign-out; one
-    /// account's sign-out is `broker_sessions.take`).
+    /// account's sign-out is `broker_sessions.take`). The entry takes the
+    /// app's default master object (Phase 1: one session at a time, and its
+    /// master is the app's master).
     pub fn set_broker_session(&self, session: Option<BrokerSession>) {
         match session {
             Some(s) => self.broker_sessions.replace(s),
             None => self.broker_sessions.clear(),
         }
+    }
+
+    /// The master handle of one (broker, account) entry, if live — the
+    /// per-session target of the master contract service (D-S2).
+    pub fn symbols_for(&self, broker: &str, account: &str) -> Option<SymbolResolver> {
+        self.broker_sessions.symbols_for(broker, account)
     }
 
     /// The signed-in OpenAlgo user, if any (single-user app).
@@ -1104,5 +1175,34 @@ mod session_store_tests {
         t.clock.set(ist(6, 10, 0, 0));
         assert!(t.ctx.get_broker_session().is_some());
         assert_eq!(t.ctx.broker_sessions.len(), 1);
+    }
+
+    /// D-S2 step 2: an entry is installed with the store's default master
+    /// handle; a load through that handle is visible through the entry (the
+    /// two share one master object, as the app's modules do); a re-sign-in
+    /// of the pair keeps the master it already holds.
+    #[test]
+    fn an_entry_keeps_the_master_handle_of_its_install() {
+        use crate::brokers::common::symbols::tests::row;
+        let store = SessionStore::default();
+        let master = SymbolResolver::default();
+        store.with_default_symbols(master.clone());
+        store.replace(session("zerodha", DEFAULT_ACCOUNT, ist(5, 10, 0, 0)));
+        let handle = store
+            .symbols_for("zerodha", DEFAULT_ACCOUNT)
+            .expect("the installed entry holds its master handle");
+        assert!(handle.is_empty());
+        master.load(vec![row("SBIN", "SBIN", "NSE", "779521")]);
+        assert_eq!(handle.token("SBIN", "NSE").as_deref(), Some("779521"));
+        // A re-sign-in of the same pair keeps the master it already holds.
+        store.upsert(session("zerodha", DEFAULT_ACCOUNT, ist(5, 11, 0, 0)));
+        assert_eq!(
+            store
+                .symbols_for("zerodha", DEFAULT_ACCOUNT)
+                .unwrap()
+                .token("SBIN", "NSE")
+                .as_deref(),
+            Some("779521")
+        );
     }
 }
