@@ -108,6 +108,7 @@ async fn the_wait_reads_the_managers_ticks_and_ends_at_its_timeout() {
         .install(&crate::security::Unlocked::random().unwrap());
     app.set_broker_session(Some(crate::state::BrokerSession {
         broker_id: "zerodha".into(),
+        account_id: crate::security::crypto::DEFAULT_ACCOUNT.into(),
         auth_token: "mock-access-token".into(),
         feed_token: None,
         user_id: "AB1234".into(),

@@ -22,6 +22,7 @@ use crate::session::web::WebSessionStore;
 use crate::websocket::WebSocketManager;
 use chrono::{DateTime, Utc};
 use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,11 +35,106 @@ pub type AppContext = AppState;
 #[derive(Debug, Clone)]
 pub struct BrokerSession {
     pub broker_id: String,
+    /// The broker account the session is signed in with (MULTI_BROKER_PLAN
+    /// D3); pre-multi-session installs are the legacy single account.
+    pub account_id: String,
     pub auth_token: Secret,
     pub feed_token: Option<Secret>,
     pub user_id: String,
     pub user_name: Option<String>,
     pub authenticated_at: DateTime<Utc>,
+}
+
+/// The live broker sessions, keyed by (broker, account). Today one at a
+/// time; the multi-session core grows it to several (MULTI_BROKER_PLAN
+/// Phase 1) without touching the 77 `get_broker_session` call sites, which
+/// keep resolving the default target (the newest session).
+#[derive(Debug, Default)]
+pub struct SessionStore {
+    entries: RwLock<HashMap<(String, String), BrokerSession>>,
+}
+
+impl SessionStore {
+    /// Record a session for its (broker, account), replacing any earlier
+    /// one of the same pair.
+    pub fn upsert(&self, session: BrokerSession) {
+        self.entries.write().insert(
+            (session.broker_id.clone(), session.account_id.clone()),
+            session,
+        );
+    }
+
+    /// The session of one (broker, account), if live.
+    pub fn get(&self, broker: &str, account: &str) -> Option<BrokerSession> {
+        self.entries
+            .read()
+            .get(&(broker.to_string(), account.to_string()))
+            .cloned()
+    }
+
+    /// Remove the session of one (broker, account).
+    pub fn take(&self, broker: &str, account: &str) -> Option<BrokerSession> {
+        self.entries
+            .write()
+            .remove(&(broker.to_string(), account.to_string()))
+    }
+
+    /// Remove the session of one (broker, account) only when `keep`
+    /// accepts it, so a sign-in that replaced it meanwhile survives.
+    pub fn take_if(
+        &self,
+        broker: &str,
+        account: &str,
+        keep: impl Fn(&BrokerSession) -> bool,
+    ) -> Option<BrokerSession> {
+        let mut entries = self.entries.write();
+        let key = (broker.to_string(), account.to_string());
+        entries
+            .get(&key)
+            .is_some_and(keep)
+            .then(|| entries.remove(&key))
+            .flatten()
+    }
+
+    /// Every live session, newest first.
+    pub fn list(&self) -> Vec<BrokerSession> {
+        let mut v: Vec<BrokerSession> = self.entries.read().values().cloned().collect();
+        v.sort_by_key(|s| std::cmp::Reverse(s.authenticated_at));
+        v
+    }
+
+    /// The newest live session, whatever its age (the daily-boundary check
+    /// is the reader's call, as in `AppState::get_broker_session`).
+    pub fn newest(&self) -> Option<BrokerSession> {
+        self.list().into_iter().next()
+    }
+
+    /// End every live session (app sign-out, not one account's — that is
+    /// `take`).
+    pub fn clear(&self) {
+        self.entries.write().clear();
+    }
+
+    /// Replace whatever is live with this one session (the
+    /// single-session `set_broker_session` contract: the last set wins,
+    /// whatever its timestamp). The multi-session core installs a second
+    /// session with `upsert` without ending the first.
+    pub fn replace(&self, session: BrokerSession) {
+        let mut entries = self.entries.write();
+        entries.clear();
+        entries.insert(
+            (session.broker_id.clone(), session.account_id.clone()),
+            session,
+        );
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.read().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.read().is_empty()
+    }
 }
 
 /// Symbol master row (every web `SymToken` column).
@@ -72,10 +168,11 @@ pub struct AppState {
     pub sessions: WebSessionStore,
     pub limiter: RateLimiter,
     pub api_keys: ApiKeyCache,
-    pub broker_session: RwLock<Option<BrokerSession>>,
     /// The account the connected session trades through, worked out once
     /// for it (`services::session_account`, NEW-TR-01).
     pub session_account: crate::services::session_account::AccountCache,
+    /// The live broker sessions, keyed by (broker, account) (D3).
+    pub broker_sessions: Arc<SessionStore>,
     /// A broker session ended in memory whose stored row is still to be
     /// revoked (the database write failed), and which rows (every one, or
     /// the daily boundary's). While set, no stored session is resumed; the
@@ -432,7 +529,7 @@ impl AppState {
             sessions: WebSessionStore::new(),
             limiter: RateLimiter::new(),
             api_keys: ApiKeyCache::new(),
-            broker_session: RwLock::new(None),
+            broker_sessions: Arc::new(SessionStore::default()),
             session_account: Default::default(),
             revoke_pending: Mutex::new(None),
             session_switch: tokio::sync::Mutex::new(()),
@@ -662,12 +759,12 @@ impl AppState {
         self.get_broker_session().is_some()
     }
 
-    /// The live broker session, or `None` once it has crossed the daily
-    /// boundary (it is then dropped from memory; the scheduler revokes the
-    /// stored row). A continuous (crypto) session has no daily boundary
-    /// (SES-01).
+    /// The live broker session of the default target (the newest one), or
+    /// `None` once it has crossed the daily boundary (it is then dropped
+    /// from memory; the scheduler revokes the stored row). A continuous
+    /// (crypto) session has no daily boundary (SES-01).
     pub fn get_broker_session(&self) -> Option<BrokerSession> {
-        let s = self.broker_session.read().clone()?;
+        let s = self.broker_sessions.newest()?;
         let continuous = !crate::brokers::catalog::has_daily_boundary(&s.broker_id);
         let fresh = {
             let cfg = self.config.read();
@@ -681,21 +778,24 @@ impl AppState {
         if continuous || fresh {
             return Some(s);
         }
-        // Clear only the session this read found stale: a sign-in that set a
+        // Drop only the session this read found stale: a sign-in that set a
         // new one in between keeps it (KEY-01 cache rules: a writer never
         // undoes a newer value).
-        let mut live = self.broker_session.write();
-        if live
-            .as_ref()
-            .is_some_and(|l| l.broker_id == s.broker_id && l.authenticated_at == s.authenticated_at)
-        {
-            *live = None;
-        }
+        let at = s.authenticated_at;
+        let (broker, account) = (s.broker_id.clone(), s.account_id.clone());
+        self.broker_sessions
+            .take_if(&broker, &account, |l| l.authenticated_at == at);
         None
     }
 
+    /// Install a session (replacing whatever is live — the last set wins,
+    /// as before), or end every live session when `None` (app sign-out; one
+    /// account's sign-out is `broker_sessions.take`).
     pub fn set_broker_session(&self, session: Option<BrokerSession>) {
-        *self.broker_session.write() = session;
+        match session {
+            Some(s) => self.broker_sessions.replace(s),
+            None => self.broker_sessions.clear(),
+        }
     }
 
     /// The signed-in OpenAlgo user, if any (single-user app).
@@ -770,5 +870,239 @@ mod recovery_alert_tests {
         for word in ["WAL", "DuckDB", "replay", "rror"] {
             assert!(!ours[0].message.contains(word), "{}", word);
         }
+    }
+}
+
+#[cfg(test)]
+mod session_store_tests {
+    //! MULTI_BROKER_PLAN phase 1, step 1: the live sessions keyed by
+    //! (broker, account), and the single-session contract the
+    //! `get_broker_session` call sites keep using through `AppState`.
+    use super::testing::{self, TestCtx};
+    use super::*;
+    use crate::brokers::mock::MockBroker;
+    use crate::brokers::{Broker, BrokerRegistry};
+    use crate::security::crypto::DEFAULT_ACCOUNT;
+    use chrono::TimeZone;
+    use chrono_tz::Asia::Kolkata;
+
+    fn ist(d: u32, h: u32, m: u32, s: u32) -> DateTime<Utc> {
+        Kolkata
+            .with_ymd_and_hms(2026, 10, d, h, m, s)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn session(broker: &str, account: &str, at: DateTime<Utc>) -> BrokerSession {
+        BrokerSession {
+            broker_id: broker.into(),
+            account_id: account.into(),
+            auth_token: Secret::new("mock-access-token"),
+            feed_token: None,
+            user_id: "AB1234".into(),
+            user_name: None,
+            authenticated_at: at,
+        }
+    }
+
+    fn ctx_at(now: DateTime<Utc>) -> TestCtx {
+        testing::build(
+            BrokerRegistry::with(vec![
+                Arc::new(MockBroker::new("zerodha")) as Arc<dyn Broker>,
+                Arc::new(MockBroker::new("deltaexchange")) as Arc<dyn Broker>,
+            ]),
+            now,
+        )
+    }
+
+    #[test]
+    fn upsert_records_the_pair_and_get_reads_it_back() {
+        let store = SessionStore::default();
+        store.upsert(session("zerodha", DEFAULT_ACCOUNT, ist(5, 10, 0, 0)));
+        assert_eq!(store.len(), 1);
+        assert_eq!(
+            store
+                .get("zerodha", DEFAULT_ACCOUNT)
+                .unwrap()
+                .authenticated_at,
+            ist(5, 10, 0, 0)
+        );
+        assert!(store.get("upstox", DEFAULT_ACCOUNT).is_none());
+        assert!(store.get("zerodha", "second").is_none());
+    }
+
+    #[test]
+    fn broker_and_account_pairs_live_side_by_side() {
+        let store = SessionStore::default();
+        for (b, a) in [
+            ("zerodha", DEFAULT_ACCOUNT),
+            ("zerodha", "second"),
+            ("upstox", DEFAULT_ACCOUNT),
+            ("upstox", "second"),
+        ] {
+            store.upsert(session(b, a, ist(5, 10, 0, 0)));
+        }
+        assert_eq!(store.len(), 4);
+        assert!(store.get("zerodha", "second").is_some());
+        assert!(store.get("upstox", DEFAULT_ACCOUNT).is_some());
+    }
+
+    #[test]
+    fn upsert_of_the_same_pair_replaces_the_earlier_one() {
+        let store = SessionStore::default();
+        store.upsert(session("zerodha", DEFAULT_ACCOUNT, ist(5, 9, 0, 0)));
+        store.upsert(session("zerodha", DEFAULT_ACCOUNT, ist(5, 10, 0, 0)));
+        assert_eq!(store.len(), 1);
+        assert_eq!(
+            store
+                .get("zerodha", DEFAULT_ACCOUNT)
+                .unwrap()
+                .authenticated_at,
+            ist(5, 10, 0, 0)
+        );
+    }
+
+    #[test]
+    fn take_ends_only_its_own_pair() {
+        let store = SessionStore::default();
+        store.upsert(session("zerodha", DEFAULT_ACCOUNT, ist(5, 10, 0, 0)));
+        store.upsert(session("zerodha", "second", ist(5, 10, 0, 0)));
+        store.upsert(session("upstox", DEFAULT_ACCOUNT, ist(5, 10, 0, 0)));
+        assert!(store.take("zerodha", DEFAULT_ACCOUNT).is_some());
+        assert_eq!(store.len(), 2);
+        assert!(store.get("zerodha", "second").is_some());
+        assert!(store.get("upstox", DEFAULT_ACCOUNT).is_some());
+        assert!(store.take("zerodha", DEFAULT_ACCOUNT).is_none());
+    }
+
+    #[test]
+    fn take_if_keeps_a_session_replaced_in_the_meantime() {
+        let store = SessionStore::default();
+        let old = ist(5, 9, 0, 0);
+        store.upsert(session("zerodha", DEFAULT_ACCOUNT, old));
+        // A sign-in that replaced it meanwhile survives the stale drop.
+        store.upsert(session("zerodha", DEFAULT_ACCOUNT, ist(5, 10, 0, 0)));
+        assert!(store
+            .take_if("zerodha", DEFAULT_ACCOUNT, |s| s.authenticated_at == old)
+            .is_none());
+        assert!(store.get("zerodha", DEFAULT_ACCOUNT).is_some());
+        // ...and the matching one is dropped.
+        let live = store
+            .get("zerodha", DEFAULT_ACCOUNT)
+            .unwrap()
+            .authenticated_at;
+        assert!(store
+            .take_if("zerodha", DEFAULT_ACCOUNT, |s| s.authenticated_at == live)
+            .is_some());
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn list_is_newest_first_and_newest_takes_the_front() {
+        let store = SessionStore::default();
+        store.upsert(session("upstox", "second", ist(5, 11, 0, 0)));
+        store.upsert(session("zerodha", DEFAULT_ACCOUNT, ist(5, 9, 0, 0)));
+        store.upsert(session("upstox", DEFAULT_ACCOUNT, ist(5, 10, 0, 0)));
+        let list = store.list();
+        assert_eq!(
+            list.iter()
+                .map(|s| (s.broker_id.as_str(), s.account_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("upstox", "second"),
+                ("upstox", DEFAULT_ACCOUNT),
+                ("zerodha", DEFAULT_ACCOUNT),
+            ]
+        );
+        assert_eq!(store.newest().unwrap().account_id, "second");
+    }
+
+    #[test]
+    fn replace_keeps_only_the_last_set_session() {
+        let store = SessionStore::default();
+        store.upsert(session("zerodha", DEFAULT_ACCOUNT, ist(5, 10, 0, 0)));
+        store.upsert(session("upstox", DEFAULT_ACCOUNT, ist(5, 11, 0, 0)));
+        store.replace(session("angel", DEFAULT_ACCOUNT, ist(5, 8, 0, 0)));
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.newest().unwrap().broker_id, "angel");
+    }
+
+    #[test]
+    fn clear_ends_every_session() {
+        let store = SessionStore::default();
+        store.upsert(session("zerodha", DEFAULT_ACCOUNT, ist(5, 10, 0, 0)));
+        store.upsert(session("zerodha", "second", ist(5, 10, 0, 0)));
+        store.clear();
+        assert!(store.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_default_resolves_to_the_newest_live_session() {
+        let t = ctx_at(ist(5, 10, 0, 0));
+        // Two brokers signed in at once: the default target is the newer.
+        t.ctx
+            .broker_sessions
+            .upsert(session("zerodha", DEFAULT_ACCOUNT, ist(5, 9, 0, 0)));
+        t.ctx
+            .broker_sessions
+            .upsert(session("deltaexchange", DEFAULT_ACCOUNT, ist(5, 10, 0, 0)));
+        let s = t.ctx.get_broker_session().unwrap();
+        assert_eq!(s.broker_id, "deltaexchange");
+        // The older one is still live beside it.
+        assert_eq!(t.ctx.broker_sessions.len(), 2);
+        assert!(t
+            .ctx
+            .broker_sessions
+            .get("zerodha", DEFAULT_ACCOUNT)
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn installing_a_session_replaces_every_other_one() {
+        let t = ctx_at(ist(5, 10, 0, 0));
+        t.ctx
+            .broker_sessions
+            .upsert(session("zerodha", DEFAULT_ACCOUNT, ist(5, 9, 0, 0)));
+        t.ctx
+            .broker_sessions
+            .upsert(session("upstox", DEFAULT_ACCOUNT, ist(5, 9, 30, 0)));
+        t.ctx
+            .set_broker_session(Some(session("angel", DEFAULT_ACCOUNT, ist(5, 10, 0, 0))));
+        assert_eq!(t.ctx.broker_sessions.len(), 1);
+        assert_eq!(t.ctx.get_broker_session().unwrap().broker_id, "angel");
+    }
+
+    #[tokio::test]
+    async fn signing_out_clears_every_live_session() {
+        let t = ctx_at(ist(5, 10, 0, 0));
+        t.ctx
+            .broker_sessions
+            .upsert(session("zerodha", DEFAULT_ACCOUNT, ist(5, 9, 0, 0)));
+        t.ctx.set_broker_session(None);
+        assert!(t.ctx.broker_sessions.is_empty());
+        assert!(t.ctx.get_broker_session().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_stale_boundary_broker_is_dropped_from_the_store() {
+        let t = ctx_at(ist(5, 10, 0, 0));
+        t.ctx
+            .broker_sessions
+            .upsert(session("zerodha", DEFAULT_ACCOUNT, ist(5, 10, 0, 0)));
+        // Cross the 03:00 IST boundary.
+        t.clock.set(ist(6, 10, 0, 0));
+        assert!(t.ctx.get_broker_session().is_none());
+        assert!(t.ctx.broker_sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_continuous_session_survives_the_boundary() {
+        let t = ctx_at(ist(5, 10, 0, 0));
+        t.ctx
+            .broker_sessions
+            .upsert(session("deltaexchange", DEFAULT_ACCOUNT, ist(5, 10, 0, 0)));
+        t.clock.set(ist(6, 10, 0, 0));
+        assert!(t.ctx.get_broker_session().is_some());
+        assert_eq!(t.ctx.broker_sessions.len(), 1);
     }
 }

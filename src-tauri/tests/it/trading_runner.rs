@@ -1841,6 +1841,7 @@ async fn a_live_openscript_run_refuses_a_broker_switch_until_it_is_paused() {
     let t = setup().await;
     let ctx = &t.h.ctx;
     let session = || BrokerSession {
+        account_id: openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT.into(),
         broker_id: "zerodha".into(),
         auth_token: "mock-access-token".into(),
         feed_token: None,
@@ -2396,6 +2397,7 @@ mod approvals {
         BrokerAuthService::persist(
             &h.ctx,
             &BrokerSession {
+                account_id: openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT.into(),
                 broker_id: "zerodha".into(),
                 auth_token: "mock-access-token".into(),
                 feed_token: None,

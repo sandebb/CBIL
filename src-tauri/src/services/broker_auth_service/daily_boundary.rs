@@ -32,17 +32,20 @@ impl BrokerAuthService {
     ) -> Result<bool> {
         let daily = catalog::has_daily_boundary;
         let _held = Self::session_lock(state).await;
-        let taken = {
-            let mut live = state.broker_session.write();
-            if live
-                .as_ref()
-                .is_some_and(|s| s.authenticated_at < boundary && daily(&s.broker_id))
-            {
-                live.take()
-            } else {
-                None
-            }
-        };
+        // The live session that predates the boundary (today one; the
+        // multi-session core ends each of theirs, D-S3). A sign-in that
+        // replaced it meanwhile wins (take_if keeps the newer one).
+        let taken = state
+            .broker_sessions
+            .list()
+            .into_iter()
+            .find(|s| s.authenticated_at < boundary && daily(&s.broker_id));
+        if let Some(t) = &taken {
+            let at = t.authenticated_at;
+            state
+                .broker_sessions
+                .take_if(&t.broker_id, &t.account_id, |l| l.authenticated_at == at);
+        }
         let torn_down = state.runtime.teardown_started_before(state, boundary).await;
         let ended = taken.is_some() || torn_down;
         if ended {

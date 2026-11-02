@@ -157,6 +157,7 @@ async fn a_samco_fill_reaches_the_bus_the_page_the_stream_and_the_reconciler() {
     // A Samco session: the runtime downloads the master and starts the
     // order poller through `create_order_feed`.
     let session = BrokerSession {
+        account_id: openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT.into(),
         broker_id: "samco".into(),
         auth_token: Secret::new("<SESSION_TOKEN>"),
         feed_token: None,

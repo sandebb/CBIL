@@ -1112,6 +1112,7 @@ mod app {
             BrokerAuthService::persist(
                 &ctx,
                 &BrokerSession {
+                    account_id: openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT.into(),
                     broker_id: "deltaexchange".into(),
                     auth_token: format!("{}:{}", KEY, SECRET).into(),
                     feed_token: None,

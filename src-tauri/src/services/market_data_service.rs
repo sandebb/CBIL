@@ -625,6 +625,7 @@ mod tests {
         ctx.load_symbol_cache(vec![sensex]);
         ctx.set_broker_session(Some(crate::state::BrokerSession {
             broker_id: "dhan".into(),
+            account_id: crate::security::crypto::DEFAULT_ACCOUNT.into(),
             auth_token: crate::security::Secret::new("t"),
             feed_token: None,
             user_id: "AB1".into(),
@@ -685,6 +686,7 @@ mod tests {
         ]);
         ctx.set_broker_session(Some(crate::state::BrokerSession {
             broker_id: "zerodha".into(),
+            account_id: crate::security::crypto::DEFAULT_ACCOUNT.into(),
             auth_token: crate::security::Secret::new("t"),
             feed_token: None,
             user_id: "AB1".into(),

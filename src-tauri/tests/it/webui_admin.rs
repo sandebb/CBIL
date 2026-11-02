@@ -634,6 +634,7 @@ async fn diagnostics_show_the_market_data_stream_of_a_broker_session() {
 
     h.ctx
         .set_broker_session(Some(openalgo_desktop_lib::state::BrokerSession {
+            account_id: openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT.into(),
             broker_id: "zerodha".into(),
             auth_token: openalgo_desktop_lib::security::Secret::new("t"),
             feed_token: None,

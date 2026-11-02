@@ -201,6 +201,7 @@ impl App {
         BrokerAuthService::persist(
             &self.ctx,
             &BrokerSession {
+                account_id: openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT.into(),
                 broker_id: "fyers".into(),
                 auth_token: "APPID-100:access-token".into(),
                 feed_token: None,

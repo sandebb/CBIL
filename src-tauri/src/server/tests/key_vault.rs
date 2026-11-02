@@ -574,6 +574,7 @@ async fn locked_before_sign_in_and_after_logout_every_surface_refuses() {
         &ctx,
         &BrokerSession {
             broker_id: "zerodha".into(),
+            account_id: crate::security::crypto::DEFAULT_ACCOUNT.into(),
             auth_token: "mock-access-token".into(),
             feed_token: None,
             user_id: "AB1234".into(),
@@ -843,6 +844,7 @@ async fn a_new_password_without_the_old_one_drops_only_encrypted_values() {
         &ctx,
         &BrokerSession {
             broker_id: "zerodha".into(),
+            account_id: crate::security::crypto::DEFAULT_ACCOUNT.into(),
             auth_token: "mock-access-token".into(),
             feed_token: Some("feed".into()),
             user_id: "AB1234".into(),

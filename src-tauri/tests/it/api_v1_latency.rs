@@ -46,14 +46,15 @@ async fn a_live_order_records_its_broker_time_under_the_broker_it_went_to() {
     let at_broker = async {
         gate.entered.notified().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        *h.ctx.broker_session.write() = Some(BrokerSession {
+        h.ctx.set_broker_session(Some(BrokerSession {
             broker_id: "dhan".into(),
+            account_id: openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT.into(),
             auth_token: "other-token".into(),
             feed_token: None,
             user_id: "CD5678".into(),
             user_name: None,
             authenticated_at: h.ctx.now(),
-        });
+        }));
         gate.release.notify_one();
     };
     let ((s, v), ()) = tokio::join!(

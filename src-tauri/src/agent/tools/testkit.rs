@@ -119,6 +119,7 @@ impl Kit {
             &app,
             &BrokerSession {
                 broker_id: "zerodha".into(),
+                account_id: crate::security::crypto::DEFAULT_ACCOUNT.into(),
                 auth_token: "mock-access-token".into(),
                 feed_token: None,
                 user_id: "AB1234".into(),

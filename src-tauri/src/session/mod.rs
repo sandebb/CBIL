@@ -198,6 +198,7 @@ mod tests {
     /// Store a session signed in now, as a sign-in does (no streaming).
     fn sign_in(ctx: &AppState, broker: &str) -> BrokerSession {
         let s = BrokerSession {
+            account_id: crate::security::crypto::DEFAULT_ACCOUNT.into(),
             broker_id: broker.into(),
             auth_token: Secret::new("mock-access-token"),
             feed_token: None,

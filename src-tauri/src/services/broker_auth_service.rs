@@ -525,6 +525,9 @@ impl BrokerAuthService {
         }
         let session = BrokerSession {
             broker_id: broker_id.to_string(),
+            // The sign-in used the default account's keys (D3); a named
+            // account arrives with the accounts UI.
+            account_id: DEFAULT_ACCOUNT.to_string(),
             auth_token: Secret::new(resp.auth_token),
             feed_token: resp.feed_token.map(Secret::new),
             user_id: resp.user_id,
@@ -777,7 +780,8 @@ impl BrokerAuthService {
         stored: auth::StoredBrokerSession,
     ) -> Result<Option<BrokerSession>> {
         let session = BrokerSession {
-            broker_id: stored.broker_id,
+            broker_id: stored.broker_id.clone(),
+            account_id: stored.account_id.clone(),
             auth_token: stored.auth_token,
             feed_token: stored.feed_token,
             user_id: stored.user_id.unwrap_or_default(),

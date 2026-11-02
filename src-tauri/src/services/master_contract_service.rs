@@ -396,11 +396,7 @@ async fn download_claimed(
     .await
     .map_err(|e| AppError::Internal(format!("symbol store task failed: {}", e)))??;
     // Install it only for the broker whose session this still is.
-    let session = ctx
-        .broker_session
-        .read()
-        .as_ref()
-        .map(|s| s.broker_id.clone());
+    let session = ctx.broker_sessions.newest().map(|s| s.broker_id);
     if let Some(other) = session.filter(|b| b != id) {
         tracing::warn!(
             "Master contract for {} downloaded after the session moved to {}; not loaded",
@@ -753,6 +749,7 @@ mod tests {
     fn session_for(ctx: &AppState, broker: &str) {
         ctx.set_broker_session(Some(crate::state::BrokerSession {
             broker_id: broker.into(),
+            account_id: crate::security::crypto::DEFAULT_ACCOUNT.into(),
             auth_token: crate::security::Secret::new("t"),
             feed_token: None,
             user_id: "AB1".into(),
@@ -887,6 +884,7 @@ mod tests {
                 .count()
         };
         let session = |b: &str| crate::state::BrokerSession {
+            account_id: crate::security::crypto::DEFAULT_ACCOUNT.into(),
             broker_id: b.into(),
             auth_token: crate::security::Secret::new("t"),
             feed_token: None,

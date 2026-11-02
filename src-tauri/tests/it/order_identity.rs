@@ -164,6 +164,7 @@ async fn two_accounts(semi_auto: bool) -> Two {
 
 fn session(h: &H, broker: &str, account: &str) -> BrokerSession {
     BrokerSession {
+        account_id: openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT.into(),
         broker_id: broker.into(),
         auth_token: "mock-access-token".into(),
         feed_token: None,

@@ -440,6 +440,7 @@ async fn sec05b_a_failed_revoke_survives_a_restart() {
         &ctx,
         &BrokerSession {
             broker_id: "zerodha".into(),
+            account_id: crate::security::crypto::DEFAULT_ACCOUNT.into(),
             auth_token: "mock-access-token".into(),
             feed_token: None,
             user_id: "AB1234".into(),
@@ -1117,6 +1118,7 @@ async fn flow03_a_session_and_the_active_broker_are_stored_together() {
         h.ctx(),
         &BrokerSession {
             broker_id: "zerodha".into(),
+            account_id: crate::security::crypto::DEFAULT_ACCOUNT.into(),
             auth_token: "mock-access-token".into(),
             feed_token: None,
             user_id: "AB1234".into(),

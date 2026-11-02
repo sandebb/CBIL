@@ -93,6 +93,7 @@ async fn app_auth_uses_the_stored_api_key_and_broker_session() {
     );
 
     ctx.set_broker_session(Some(BrokerSession {
+        account_id: openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT.into(),
         broker_id: "zerodha".into(),
         auth_token: Secret::new("t"),
         feed_token: None,
@@ -192,6 +193,7 @@ async fn authenticated_clients_are_closed_when_their_authentication_ends() {
 
     // 2. A broker session starts, then the trader signs out.
     let session = BrokerSession {
+        account_id: openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT.into(),
         broker_id: "zerodha".into(),
         auth_token: Secret::new("t"),
         feed_token: None,

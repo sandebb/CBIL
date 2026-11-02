@@ -89,6 +89,7 @@ impl H {
             self.ctx(),
             &BrokerSession {
                 broker_id: "zerodha".into(),
+                account_id: crate::security::crypto::DEFAULT_ACCOUNT.into(),
                 auth_token: "mock-access-token".into(),
                 feed_token: None,
                 user_id: "AB1234".into(),
@@ -2227,6 +2228,7 @@ async fn every_way_to_create_a_broker_session_refuses_a_forged_attempt() {
             ctx,
             &BrokerSession {
                 broker_id: broker.into(),
+                account_id: crate::security::crypto::DEFAULT_ACCOUNT.into(),
                 auth_token: crate::security::Secret::new("own-token"),
                 feed_token: None,
                 user_id: "U1".into(),
@@ -2775,6 +2777,7 @@ async fn cache_reload_and_skip_check_the_stored_master() {
     let (cookie, csrf) = h.session(true);
     h.ctx().set_broker_session(Some(BrokerSession {
         broker_id: "zerodha".into(),
+        account_id: crate::security::crypto::DEFAULT_ACCOUNT.into(),
         auth_token: crate::security::Secret::new("mock-access-token"),
         feed_token: None,
         user_id: "AB1234".into(),
@@ -2916,6 +2919,7 @@ async fn master_contract_routes_and_server_settings_status() {
     );
     h.ctx().set_broker_session(Some(BrokerSession {
         broker_id: "zerodha".into(),
+        account_id: crate::security::crypto::DEFAULT_ACCOUNT.into(),
         auth_token: crate::security::Secret::new("mock-access-token"),
         feed_token: None,
         user_id: "AB1234".into(),
