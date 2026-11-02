@@ -1,0 +1,6 @@
+# IST crontab (set CRON_TZ or the server timezone to Asia/Kolkata).
+# Refresh history after the close; the forward-test daemon itself runs under systemd/docker.
+CRON_TZ=Asia/Kolkata
+45 18 * * 1-5  cd /home/trader/nse-algo && .venv/bin/nsealgo fetch-history --days 30 --minute-days 3 >> runs/cron.log 2>&1
+# Weekly robustness check of a strategy on refreshed data (Saturday morning)
+0 9 * * 6      cd /home/trader/nse-algo && .venv/bin/nsealgo walkforward momentum 2021-01-01 2026-09-25 >> runs/cron.log 2>&1

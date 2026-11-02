@@ -1,0 +1,97 @@
+# =====================================================================================================
+# NSEMLENGINE ORIG-GPU = the original model (config.yaml) trained on the Radeon 8060S GPU: deeplob device: cuda
+# + lstm: unrolled (the MIOpen RNN kernels cannot JIT on gfx1151; identical maths - nseml\deep.py UnrolledLSTM).
+# Created 29-Oct-2026 (all-model GPU switch). Run via: nseml_model.cmd orig_gpu ... (own work folder
+# work_orig_gpu). The original model (config.yaml, work\) is untouched and stays as the CPU fallback.
+# =====================================================================================================
+# Paths are NOT written here. They come from environment variables (set them once for the Windows user):
+#   NSEMLENGINE_HOME      this project folder                (default: the folder of nseml\)
+#   NSEMLENGINE_WORK_DIR  datasets, predictions, results     (default: %NSEMLENGINE_HOME%\work)
+#   NSEDATAENGINE_HOME    the data project (source of truth) (default: %NSEMLENGINE_HOME%\..\NSEDATAENGINE)
+# All input files and columns are resolved through NSEDATAENGINE's contract (contract\schema.yaml).
+#   python -m nseml paths     shows where everything resolves
+# =====================================================================================================
+
+data:
+  variant: master            # NSEDATAENGINE store: master = data\ (1991 -> today); fresh = data_fresh\
+  warmup_start: "2003-01-01" # rows before this are not loaded (features need ~250 days of history)
+  start: "2005-01-01"        # first day kept in the dataset
+
+# The prediction is made after the NSEDATAENGINE 19:30 IST update on day t, for day t+1.
+# market.parquet row t holds each global market's last close ON OR BEFORE calendar date t; closes that
+# happen after 19:30 IST on day t (US, Europe, NY commodities, USD/INR) are therefore lagged one row.
+prediction_time: after_close
+market_lag:                  # rows to lag each market column by
+  nifty_close: 0
+  vix: 0
+  nikkei225: 0               # Tokyo closes ~11:30 IST - known
+  sp500: 1
+  ftse100: 1
+  dax: 1
+  crude_oil: 1
+  gold: 1
+  usd_inr: 1
+
+universe:                    # decided each day with information up to that day only
+  min_median_turnover: 1.0e+7   # 60-day median close x volume, rupees (1 crore)
+  min_price: 10.0
+  min_history: 250           # trading days of history before the stock can enter
+
+targets:
+  vol_halflife: 20           # EWMA half-life (days) of the daily log-return volatility used to scale g, r, u, d
+  vol_floor: 0.005           # minimum daily sigma (0.5%) so quiet stocks do not blow up the scaled targets
+  max_abs_log: 0.4           # next-day gap / return / range beyond this (log) = data error -> no target
+
+walk_forward:
+  mode: rolling              # rolling (fixed train window) | expanding
+  train_years: 5
+  gap_days: 5                # trading days left out between train / val / test (no overlap leakage)
+  val_days: 63               # ~3 months: early stopping
+  test_days: 63              # ~3 months: out-of-sample scores
+  step_days: 63              # roll forward one quarter
+  first_test: "2018-01-01"   # first test window starts on/after this day
+
+quantiles: [0.1, 0.5, 0.9]
+
+lgbm:
+  num_leaves: 31
+  learning_rate: 0.08
+  n_estimators: 600
+  early_stopping: 40
+  min_child_samples: 1000
+  feature_fraction: 0.8
+  bagging_fraction: 0.7
+  bagging_freq: 1
+  max_bin: 63
+  max_train_rows: 600000     # random sample of the training window (all dates kept); raise on the PX13
+  max_val_rows: 150000
+  num_threads: 0             # 0 = all cores
+
+# ---- phase 2: DeepLOB adapted to daily data (nseml\deep.py) ------------------------------------------
+deeplob:
+  window: 60                 # days of history per sample (shorter histories are left-padded and masked)
+  channels: 64               # width after the 1 x F feature mix
+  inception_blocks: 2
+  lstm_hidden: 64
+  mlp_hidden: 128
+  dropout: 0.2
+  lstm: unrolled           # plain-ops LSTM (no MIOpen RNN kernels) - see nseml\deep.py UnrolledLSTM
+  batch_size: 1024
+  lr: 0.002                  # AdamW, one-cycle schedule
+  weight_decay: 0.0001
+  max_epochs: 8
+  patience: 2                # epochs without a better validation pinball before stopping
+  train_windows_per_epoch: 400000   # random windows from the training years each epoch; raise on the PX13
+  val_windows: 100000
+  huber_weight: 0.1          # extra Huber term on P50
+  ensemble: 1                # seeds averaged per fold (5 on the PX13 GPU)
+  seed: 7
+  device: cuda               # FORCE the GPU (ROCm reports it as 'cuda'). No silent CPU fallback - this is a GPU model.
+  num_threads: 0             # CPU threads (0 = PyTorch default = all cores)
+
+# ---- nightly forecasts (python -m nseml predict; scheduled by register_tasks.ps1) --------------------
+live:
+  model: blend               # lgbm | deeplob | blend (average of the two - best in the walk-forward)
+  retrain_every_days: 21     # retrain when the newest models are this many trading days old
+  wait_minutes: 90           # wait this long for NSEDATAENGINE to have today's session
+  keep_models: 3             # model sets kept under work\live\models

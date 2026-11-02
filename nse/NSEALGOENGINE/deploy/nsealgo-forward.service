@@ -1,0 +1,17 @@
+# systemd unit (Linux VPS with the static IP you registered with your broker).
+# sudo cp deploy/nsealgo-forward.service /etc/systemd/system/ && sudo systemctl enable --now nsealgo-forward
+[Unit]
+Description=nsealgo forward test (paper trading on live NSE data)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=trader
+WorkingDirectory=/home/trader/nse-algo
+Environment=TZ=Asia/Kolkata
+ExecStart=/home/trader/nse-algo/.venv/bin/nsealgo -c config/system.yaml forwardtest --daemon
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

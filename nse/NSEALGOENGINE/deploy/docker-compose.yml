@@ -1,0 +1,17 @@
+# Forward test as a long-running service. Run `docker compose run --rm nsealgo login <broker>` each morning
+# (SEBI requires a daily 2FA login); the daemon waits for the fresh session and then trades the day.
+services:
+  nsealgo:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args: {BROKER_EXTRA: zerodha}
+    env_file: ../.env
+    volumes:
+      - ../data:/app/data
+      - ../runs:/app/runs
+      - ../recordings:/app/recordings
+      - ../.cache:/app/.cache
+      - ../config:/app/config
+    ports: ["127.0.0.1:5000:5000"]   # OAuth redirect listener for `login`
+    restart: unless-stopped

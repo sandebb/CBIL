@@ -1,0 +1,414 @@
+# =====================================================================================================
+# NSEDATAENGINE - column contract (SOURCE OF TRUTH for every parquet file this project publishes)
+# =====================================================================================================
+# Consumers:  ALGO = NSEALGOENGINE (v3.11 daily backtest: nse_backtest.py, bt_strategies.py, nse_portfolio.py)
+#             DATA = NSEDATAENGINE itself (nse_updater.py, nse_fresh_build.py, nse_fno_universe.py)
+#             ML   = NSEMLENGINE (next-day OHLCV model)
+#
+# RULES - read before changing any parquet file
+#   1. A column exists in a published file ONLY if it is listed here. Add or remove it HERE FIRST, then in
+#      the code that produces it, then rewrite the file. Writers call nse_contract.conform(), so a column
+#      listed here but not yet produced is written as null (with a warning) instead of crashing.
+#   2. Adding a column  -> bump contract_version minor (1.0 -> 1.1). Nothing else has to change: every
+#      script reads columns BY NAME and every writer keeps columns it does not know about.
+#   3. Removing / renaming a column -> bump major (1.x -> 2.0), move it to `retired:` with the date and
+#      reason, and first check `consumers:` - a column still used by a consumer must not be removed.
+#   4. `adjust:` tells the corporate-action code how to back-adjust a column on a split/bonus:
+#      price = multiply by the factor, volume = divide by the factor, none = leave as is.
+#   5. `in:` lists the store variants that carry the column: master = data\ (1991 -> today, updater),
+#      fresh = data_fresh\ (5-year rebuild from NSE files). Omitted = both.
+#   6. Check every file against this contract:  python nse_contract.py validate
+#   7. No script hard-codes a folder or file name. Folders come from `locations:` (each can be moved with
+#      its environment variable), file names from each dataset's `files:`. To move a folder: change the
+#      environment variable (or the `dir:` here) - no code change.
+# =====================================================================================================
+contract_version: "1.10"
+updated: "2026-10-29"   # 1.10: intraday_daily ok: the newest day before NSE publishes the close (the 15:37 at-close build) is ok on the session-shape checks alone; re-checked after the 19:30 update. 1.9: + location minute_archive, dataset intraday_daily (nse_intraday.py, intraday features from 1-minute bars). 1.8: + short_selling, mtf (nse_alt_data.py). 1.7: + location / dataset at_close (nse_close_snapshot.py, 15:30 bars for the at-close forecast). 1.6: + location / dataset preopen (nse_preopen.py, NSE pre-open auction snapshots). 1.5: + delivery, deals, insider, surveillance, shareholding, pledge, index_changes (nse_alt_data.py). 1.4: + location tbt (Fyers TBT recordings). 1.3: + dataset sectors (NSE sector per stock). 1.2: shared data area (NSE_DATA_ROOT, `shared:`); + fresh2019
+
+# Project root = environment variable NSEDATAENGINE_HOME (set by migrate\register_project.ps1); if it is not
+# set, the folder nse_contract.py is in. Each location below = its environment variable if set, otherwise
+# <root>\<dir>. register_project.ps1 sets every `env:` below for the Windows user.
+# Shared data area (since 1.2): when the environment variable NSE_DATA_ROOT is set (e.g. C:\NSE\DATA - one data
+# folder per engine), a location without its own variable resolves to <NSE_DATA_ROOT>\<shared:>. Order:
+# the location's own variable  >  NSE_DATA_ROOT\<shared>  >  <root>\<dir>.
+#   python nse_contract.py paths     shows where every location and file resolves on this PC
+locations:
+  master:            {dir: data,                env: NSEDATAENGINE_DATA_DIR,      shared: NSEDATAENGINE/data, desc: "updater store, 1991 -> today (+ cache, logs)"}
+  fresh:             {dir: data_fresh,          env: NSEDATAENGINE_FRESH_DIR,     shared: NSEDATAENGINE/data_fresh, desc: "5-year rebuild from NSE files (+ cache, audit)"}
+  ref:               {dir: data_ref,            env: NSEDATAENGINE_REF_DIR,       shared: NSEDATAENGINE/data_ref, desc: "reference data: F&O universe (+ cache)"}
+  events:            {dir: data/events,         env: NSEDATAENGINE_EVENTS_DIR,    shared: NSEDATAENGINE/data/events, desc: "results calendar / board meetings cache"}
+  backtest_results:  {dir: backtest_results,    env: NSEDATAENGINE_BACKTEST_DIR,  shared: NSEDATAENGINE/backtest_results, desc: "nse_backtest.py runs"}
+  portfolio_results: {dir: portfolio_results,   env: NSEDATAENGINE_PORTFOLIO_DIR, shared: NSEDATAENGINE/portfolio_results, desc: "nse_portfolio.py runs"}
+  signals:           {dir: signals,             env: NSEDATAENGINE_SIGNALS_DIR,   shared: NSEDATAENGINE/signals, desc: "nse_signals.py: next-session signals (csv/html) + scan log"}
+  fresh2019:         {dir: data_fresh_2019,     env: NSEDATAENGINE_FRESH2019_DIR, shared: NSEDATAENGINE/data_fresh_2019, desc: "survivorship-free build from 2019 (backtests: --data-dir)"}
+  tbt:               {dir: tbt,                 env: NSEDATAENGINE_TBT_DIR,       shared: NSEDATAENGINE/tbt, desc: "Fyers TBT 50-level depth recordings, tbt/YYYY-MM-DD/part-*.parquet, written by NSEALGOENGINE (nsealgo tbt-record / feeds.depth_overlay.tbt_record); columns in nsealgo/data/tbt_recorder.py"}
+  preopen:           {dir: data/preopen,        env: NSEDATAENGINE_PREOPEN_DIR,   shared: NSEDATAENGINE/data/preopen, desc: "NSE pre-open auction snapshots 09:00-09:14, one parquet per day (+ raw replies, 60 days)"}
+  at_close:          {dir: data/at_close,       env: NSEDATAENGINE_AT_CLOSE_DIR,  shared: NSEDATAENGINE/data/at_close, desc: "today's bar for every stock taken at 15:00 / 15:30 from Fyers (close = 15:00-15:30 VWAP), for NSEMLENGINE's 15:37 forecast"}
+  algo_engine:       {dir: ../NSEALGOENGINE,    env: NSEALGO_SRC,                 desc: "NSEALGOENGINE v3.11 source (imported by the daily backtest)"}
+  minute_archive:    {dir: ../NSEALGOENGINE/data/minute_archive, env: NSEDATAENGINE_MINUTE_DIR, desc: "Fyers 1-minute bars 2018 -> today, <SYMBOL>/<span>.parquet, written by NSEALGOENGINE (nsealgo fetch-minute-archive, task NSEALGOENGINE-MinuteArchive 19:05); read by nse_intraday.py"}
+
+datasets:
+
+  raw_ohlcv:
+    description: Daily stock bars, back-adjusted for splits / bonus / consolidation (NOT dividends).
+    files: {master: raw_ohlcv.parquet, fresh: raw_ohlcv.parquet}   # inside locations master / fresh
+    key: [company_id, datetime]
+    columns:
+      company_id:     {type: string,   adjust: none,   consumers: [ALGO, DATA, ML], desc: "ticker, latest NSE symbol (renames applied to all history)"}
+      isin:           {type: string,   adjust: none,   consumers: [DATA],           desc: "stable identity; detects renames, matches corporate actions (null for pre-NSE history)"}
+      series:         {type: string,   adjust: none,   consumers: [ML, DATA], in: [fresh], desc: "EQ / BE / BZ"}
+      source:         {type: string,   adjust: none,   consumers: [DATA], in: [fresh], desc: "NSE file format the row came from: full / legacy / udiff"}
+      datetime:       {type: datetime, adjust: none,   consumers: [ALGO, DATA, ML], desc: "trading day (midnight, no time zone)"}
+      open:           {type: float,    adjust: price,  consumers: [ALGO, DATA, ML], desc: "adjusted open"}
+      high:           {type: float,    adjust: price,  consumers: [ALGO, DATA, ML], desc: "adjusted high"}
+      low:            {type: float,    adjust: price,  consumers: [ALGO, DATA, ML], desc: "adjusted low"}
+      close:          {type: float,    adjust: price,  consumers: [ALGO, DATA, ML], desc: "adjusted close"}
+      volume:         {type: int,      adjust: volume, consumers: [ALGO, DATA, ML], desc: "adjusted traded quantity"}
+      adj_factor:     {type: float,    adjust: none,   consumers: [DATA], in: [fresh], desc: "cumulative split/bonus factor; adjusted price = nse price x adj_factor"}
+      nse_open:       {type: float,    adjust: none,   consumers: [DATA], in: [fresh], desc: "original unadjusted NSE open (audit)"}
+      nse_high:       {type: float,    adjust: none,   consumers: [DATA], in: [fresh], desc: "original unadjusted NSE high (audit)"}
+      nse_low:        {type: float,    adjust: none,   consumers: [DATA], in: [fresh], desc: "original unadjusted NSE low (audit)"}
+      nse_close:      {type: float,    adjust: none,   consumers: [DATA], in: [fresh], desc: "original unadjusted NSE close (audit)"}
+      nse_prev_close: {type: float,    adjust: none,   consumers: [DATA], in: [fresh], desc: "NSE's previous close (gap / corporate-action checks)"}
+
+  market:
+    description: One row per trading day - Indian index levels and global markets (global = last close on or before the date).
+    files: {master: market.parquet, fresh: market.parquet}
+    key: [datetime]
+    columns:
+      datetime:    {type: datetime, consumers: [ALGO, DATA, ML], desc: "trading day"}
+      nifty_close: {type: float, consumers: [ALGO, DATA, ML], desc: "Nifty 50 close (NSE index file); regime, beta"}
+      vix:         {type: float, consumers: [ALGO, ML],       desc: "India VIX close (NSE index file); regime"}
+      sp500:       {type: float, consumers: [DATA, ML],       desc: "S&P 500 close (yfinance ^GSPC); feature global_returns"}
+      ftse100:     {type: float, consumers: [ML],             desc: "FTSE 100 close (^FTSE)"}
+      dax:         {type: float, consumers: [ML],             desc: "DAX close (^GDAXI)"}
+      nikkei225:   {type: float, consumers: [ML],             desc: "Nikkei 225 close (^N225)"}
+      crude_oil:   {type: float, consumers: [ML],             desc: "WTI crude front month (CL=F)"}
+      gold:        {type: float, consumers: [ML],             desc: "gold front month (GC=F)"}
+      usd_inr:     {type: float, consumers: [ML],             desc: "USD/INR (INR=X)"}
+
+  fno_universe:
+    description: Stocks with stock futures on each trading day (from NSE F&O bhavcopies). Produced by nse_fno_universe.py.
+    files: {ref: fno_universe.parquet}
+    key: [date, symbol]
+    columns:
+      date:       {type: date,   consumers: [ALGO, DATA, ML], desc: "trading day"}
+      symbol:     {type: string, consumers: [DATA],           desc: "F&O symbol as NSE printed it; company_id is rebuilt from it after renames"}
+      company_id: {type: string, consumers: [ALGO, ML],       desc: "same stock under its latest symbol (joins to raw_ohlcv)"}
+      fut_oi:     {type: float,  consumers: [ML],             desc: "futures open interest, all expiries"}
+      fut_volume: {type: float,  consumers: [ML],             desc: "futures traded volume, all expiries"}
+      lot_size:   {type: float,  consumers: [DATA],           desc: "market lot (UDiFF files only, null before Jul 2024)"}
+      n_expiries: {type: int32,  consumers: [DATA],           desc: "futures expiries traded / open that day"}
+      source:     {type: string, consumers: [DATA],           desc: "udiff_fo / legacy_fo"}
+
+  sectors:
+    description: >-
+      NSE's sector classification of every stock (one row per company_id; join to raw_ohlcv on company_id).
+      Produced by nse_sectors.py from NSE index constituent lists + NSE's quote API; refreshed weekly by
+      run_update.bat. `sector` is the fixed list of names the whole system uses (sector caps, news filter, ML).
+    files: {ref: sectors.parquet}
+    key: [company_id]
+    columns:
+      company_id:     {type: string, consumers: [ALGO, DATA, ML], desc: "latest NSE symbol (joins to raw_ohlcv)"}
+      isin:           {type: string, consumers: [DATA],           desc: "ISIN"}
+      company_name:   {type: string, consumers: [DATA],           desc: "company name as NSE prints it"}
+      macro_sector:   {type: string, consumers: [ML],             desc: "NSE macro-economic sector (quote API only; null from index lists)"}
+      sector:         {type: string, consumers: [ALGO, DATA, ML], desc: "NSE sector, e.g. Financial Services, Capital Goods (~22 names)"}
+      industry:       {type: string, consumers: [ML],             desc: "NSE industry (quote API only)"}
+      basic_industry: {type: string, consumers: [ML],             desc: "NSE basic industry (quote API only)"}
+      source:         {type: string, consumers: [DATA],           desc: "index:<list> or quote_api"}
+      updated:        {type: date,   consumers: [DATA],           desc: "day this row was last refreshed"}
+
+  delivery:
+    description: >-
+      Delivery quantity and % of traded quantity per stock per day (NSE full bhavcopy). nse_alt_data.py.
+    files: {ref: delivery.parquet}
+    key: [company_id, date]
+    columns:
+      company_id:     {type: string, consumers: [ALGO, DATA, ML], desc: "latest symbol (joins to raw_ohlcv)"}
+      symbol:         {type: string, consumers: [DATA], desc: "symbol as NSE printed it that day"}
+      series:         {type: string, consumers: [DATA], desc: "EQ / BE / BZ"}
+      date:           {type: date,   consumers: [ALGO, DATA, ML], desc: "trading day"}
+      traded_qty:     {type: float,  consumers: [ML], desc: "shares traded"}
+      deliv_qty:      {type: float,  consumers: [ALGO, ML], desc: "shares delivered (not squared off intraday)"}
+      deliv_pct:      {type: float,  consumers: [ALGO, ML], desc: "deliv_qty / traded_qty x 100"}
+      trades:         {type: float,  consumers: [ML], desc: "number of trades"}
+
+  deals:
+    description: >-
+      Bulk and block deals (NSE). Public the same evening: disclosed = date.
+    files: {ref: deals.parquet}
+    key: [date, kind, symbol, client, side, qty, price]
+    columns:
+      date:           {type: date,   consumers: [ALGO, DATA, ML], desc: "deal day"}
+      disclosed:      {type: date,   consumers: [ALGO, ML], desc: "day the public learned of it (= date)"}
+      kind:           {type: string, consumers: [ALGO, ML], desc: "bulk / block"}
+      company_id:     {type: string, consumers: [ALGO, DATA, ML], desc: "latest symbol"}
+      symbol:         {type: string, consumers: [DATA], desc: "symbol as NSE printed it"}
+      client:         {type: string, consumers: [ALGO, ML], desc: "buyer / seller name"}
+      side:           {type: string, consumers: [ALGO, ML], desc: "BUY / SELL"}
+      qty:            {type: float,  consumers: [ALGO, ML], desc: "shares"}
+      price:          {type: float,  consumers: [ALGO, ML], desc: "trade / weighted average price"}
+      value:          {type: float,  consumers: [ALGO, ML], desc: "qty x price (Rs)"}
+      remarks:        {type: string, consumers: [DATA], desc: "NSE remarks"}
+
+  insider:
+    description: >-
+      Insider and promoter trades disclosed under SEBI PIT rules (NSE). USE `disclosed`, not the trade dates.
+    files: {ref: insider.parquet}
+    key: [disclosed, symbol, person, side, qty, trade_from]
+    columns:
+      disclosed:      {type: date,   consumers: [ALGO, DATA, ML], desc: "day NSE published the disclosure (point in time)"}
+      intimated:      {type: date,   consumers: [DATA], desc: "day the company was told"}
+      company_id:     {type: string, consumers: [ALGO, DATA, ML], desc: "latest symbol"}
+      symbol:         {type: string, consumers: [DATA], desc: "symbol as NSE printed it"}
+      person:         {type: string, consumers: [ALGO, ML], desc: "who traded"}
+      category:       {type: string, consumers: [ALGO, ML], desc: "Promoter / Promoter Group / Director / KMP / ..."}
+      sec_type:       {type: string, consumers: [DATA], desc: "Equity Shares / ..."}
+      side:           {type: string, consumers: [ALGO, ML], desc: "Buy / Sell / Pledge / Revoke / ..."}
+      mode:           {type: string, consumers: [ALGO, ML], desc: "Market Purchase / Off Market / ESOP / ..."}
+      qty:            {type: float,  consumers: [ALGO, ML], desc: "shares"}
+      value:          {type: float,  consumers: [ALGO, ML], desc: "Rs"}
+      before_pct:     {type: float,  consumers: [ML], desc: "holding % before"}
+      after_pct:      {type: float,  consumers: [ML], desc: "holding % after"}
+      trade_from:     {type: date,   consumers: [DATA], desc: "first trade day"}
+      trade_to:       {type: date,   consumers: [DATA], desc: "last trade day"}
+
+  surveillance:
+    description: >-
+      Stocks on NSE's ASM / GSM surveillance lists, one snapshot per day from the first run (no history). An avoid-list.
+    files: {ref: surveillance.parquet}
+    key: [date, symbol, list]
+    columns:
+      date:           {type: date,   consumers: [ALGO, DATA], desc: "day of the snapshot"}
+      company_id:     {type: string, consumers: [ALGO, DATA], desc: "latest symbol"}
+      symbol:         {type: string, consumers: [DATA], desc: "symbol as NSE printed it"}
+      list:           {type: string, consumers: [ALGO, DATA], desc: "asm / gsm and the sub-list (long term, short term, ...)"}
+      stage:          {type: string, consumers: [ALGO, DATA], desc: "stage / indicator as NSE gives it"}
+
+  shareholding:
+    description: >-
+      Promoter / public % per quarter from NSE's shareholding-pattern filings.
+    files: {ref: shareholding.parquet}
+    key: [company_id, period_end]
+    columns:
+      company_id:     {type: string, consumers: [ALGO, DATA, ML], desc: "latest symbol"}
+      symbol:         {type: string, consumers: [DATA], desc: "symbol as NSE printed it"}
+      period_end:     {type: date,   consumers: [ALGO, ML], desc: "quarter end"}
+      disclosed:      {type: date,   consumers: [ALGO, ML], desc: "day NSE published it (point in time)"}
+      promoter_pct:   {type: float,  consumers: [ALGO, ML], desc: "promoter + promoter group %"}
+      public_pct:     {type: float,  consumers: [ML], desc: "public %"}
+      employee_trust_pct: {type: float,  consumers: [DATA], desc: "employee trusts %"}
+      promoter_pct_change: {type: float,  consumers: [ALGO, ML], desc: "promoter % minus the previous quarter's"}
+
+  pledge:
+    description: >-
+      Promoter shares pledged (NSE pledge disclosures).
+    files: {ref: pledge.parquet}
+    key: [company_id, disclosed]
+    columns:
+      company_id:     {type: string, consumers: [ALGO, DATA, ML], desc: "latest symbol"}
+      symbol:         {type: string, consumers: [DATA], desc: "symbol / company as NSE printed it"}
+      disclosed:      {type: date,   consumers: [ALGO, ML], desc: "day published"}
+      promoter_holding_pct: {type: float,  consumers: [ML], desc: "promoter holding %"}
+      pledged_pct_of_promoter: {type: float,  consumers: [ALGO, ML], desc: "pledged shares as % of promoter shares"}
+      pledged_pct_of_total: {type: float,  consumers: [ALGO, ML], desc: "pledged shares as % of all shares"}
+
+  index_changes:
+    description: >-
+      Index member additions / removals, seen by comparing NSE's constituent lists day by day (first run = baseline).
+    files: {ref: index_changes.parquet}
+    key: [date, index, symbol, change]
+    columns:
+      date:           {type: date,   consumers: [ALGO, DATA], desc: "day the change was first seen"}
+      index:          {type: string, consumers: [ALGO, DATA], desc: "e.g. NIFTY 50, NIFTY200 MOMENTUM 30"}
+      company_id:     {type: string, consumers: [ALGO, DATA], desc: "latest symbol"}
+      symbol:         {type: string, consumers: [DATA], desc: "symbol in the list"}
+      change:         {type: string, consumers: [ALGO, DATA], desc: "added / removed / baseline"}
+
+  short_selling:
+    description: >-
+      Short sales reported by institutional investors (SEBI disclosure), total quantity per stock per day, from NSE's
+      bulk/block/short-selling archive. Public the same evening: disclosed = date.
+    files: {ref: short_selling.parquet}
+    key: [date, symbol]
+    columns:
+      date:           {type: date,   consumers: [ALGO, DATA, ML], desc: "trade day"}
+      disclosed:      {type: date,   consumers: [ALGO, ML], desc: "day the public learned of it (= date)"}
+      company_id:     {type: string, consumers: [ALGO, DATA, ML], desc: "latest symbol"}
+      symbol:         {type: string, consumers: [DATA], desc: "symbol as NSE printed it"}
+      name:           {type: string, consumers: [DATA], desc: "security name"}
+      qty:            {type: float,  consumers: [ALGO, ML], desc: "shares sold short that day (reported)"}
+
+  mtf:
+    description: >-
+      Margin Trading Facility book per stock at the end of each day (NSE 'CM - Margin Trading Disclosure'): shares
+      bought with broker funding and still carried. Published after the day: disclosed = next session.
+    files: {ref: mtf.parquet}
+    key: [date, symbol]
+    columns:
+      date:                 {type: date,   consumers: [ALGO, DATA, ML], desc: "position date"}
+      disclosed:            {type: date,   consumers: [ALGO, ML], desc: "first day the figure is usable (next session)"}
+      company_id:           {type: string, consumers: [ALGO, DATA, ML], desc: "latest symbol"}
+      symbol:               {type: string, consumers: [DATA], desc: "symbol as NSE printed it"}
+      qty_financed:         {type: float,  consumers: [ALGO, ML], desc: "shares held under MTF at end of day"}
+      amount_financed_lakh: {type: float,  consumers: [ALGO, ML], desc: "amount financed, Rs lakh, end of day"}
+      fresh_exposure:       {type: float,  consumers: [ML], desc: "new exposure that day (if NSE gives it)"}
+      exposure_liquidated:  {type: float,  consumers: [ML], desc: "exposure closed that day (if NSE gives it)"}
+
+  preopen:
+    description: >-
+      NSE pre-open auction (09:00-09:08 order entry, 09:08 equilibrium = opening price), a snapshot every 20 s plus
+      the final prices at 09:09 / 09:12 / 09:14, from the first run on (NSE keeps no history). Written by
+      nse_preopen.py record (task NSEDATAENGINE-PreOpen, Mon-Fri 08:58). Lets strategies rank on the indicative price
+      before the auction closes.
+    files: {preopen: "YYYY-MM-DD.parquet"}   # one file per trading day inside location preopen
+    key: [snap, symbol]
+    columns:
+      snap:           {type: datetime, consumers: [ALGO, DATA], desc: "PC time the snapshot was received (clock synced, see migrate/set_time_sync.ps1)"}
+      nse_time:       {type: datetime, consumers: [DATA], desc: "NSE's lastUpdateTime of the data"}
+      date:           {type: date,     consumers: [ALGO, DATA], desc: "trading day (from nse_time)"}
+      company_id:     {type: string,   consumers: [ALGO, DATA], desc: "NSE symbol on that day"}
+      symbol:         {type: string,   consumers: [DATA], desc: "symbol as NSE printed it"}
+      key:            {type: string,   consumers: [DATA], desc: "NSE list fetched: ALL, or FO / OTHERS"}
+      iep:            {type: float,    consumers: [ALGO, DATA], desc: "indicative equilibrium price (after 09:08: the opening price)"}
+      prev_close:     {type: float,    consumers: [ALGO, DATA], desc: "previous close (NSE, unadjusted)"}
+      pchange:        {type: float,    consumers: [ALGO, DATA], desc: "% change of iep vs prev_close"}
+      final_price:    {type: float,    consumers: [ALGO, DATA], desc: "equilibrium price once the auction closed (null before)"}
+      final_qty:      {type: float,    consumers: [ALGO, DATA], desc: "quantity matched at the equilibrium price"}
+      total_buy_qty:  {type: float,    consumers: [ALGO, DATA], desc: "total buy quantity in the pre-open book"}
+      total_sell_qty: {type: float,    consumers: [ALGO, DATA], desc: "total sell quantity in the pre-open book"}
+      ato_buy_qty:    {type: float,    consumers: [DATA], desc: "at-the-open (market) buy quantity"}
+      ato_sell_qty:   {type: float,    consumers: [DATA], desc: "at-the-open (market) sell quantity"}
+      turnover:       {type: float,    consumers: [DATA], desc: "NSE totalTurnover field as given"}
+
+  at_close:
+    description: >-
+      Today's daily bar per stock taken right after the 15:30 close from Fyers quotes, before NSE's end-of-day file
+      exists (nse_close_snapshot.py run, task NSEDATAENGINE-AtClose Mon-Fri 14:57). close = the 15:00-15:30
+      volume-weighted average price (NSE's closing-price method) from two snapshots, else the last price. Plus index
+      rows (NIFTY 50, INDIA VIX, NIKKEI 225). Used by NSEMLENGINE predict-close; checked nightly against NSE's close.
+    files: {at_close: "YYYY-MM-DD.parquet"}   # one file per trading day inside location at_close
+    key: [company_id, datetime]
+    columns:
+      company_id:   {type: string,   consumers: [ML, DATA], desc: "NSE symbol, or the index name for kind = index"}
+      datetime:     {type: datetime, consumers: [ML, DATA], desc: "trading day (midnight)"}
+      kind:         {type: string,   consumers: [ML, DATA], desc: "stock / index"}
+      fyers_symbol: {type: string,   consumers: [DATA], desc: "Fyers symbol quoted"}
+      open:         {type: float,    consumers: [ML, DATA], desc: "day open (Fyers)"}
+      high:         {type: float,    consumers: [ML, DATA], desc: "day high"}
+      low:          {type: float,    consumers: [ML, DATA], desc: "day low"}
+      close:        {type: float,    consumers: [ML, DATA], desc: "estimated official close: vwap30 if available, else ltp"}
+      volume:       {type: float,    consumers: [ML, DATA], desc: "day volume at 15:30"}
+      ltp:          {type: float,    consumers: [DATA], desc: "last traded price at 15:30"}
+      vwap30:       {type: float,    consumers: [DATA], desc: "VWAP of the trades between the 15:00 and 15:30 snapshots"}
+      close_src:    {type: string,   consumers: [ML, DATA], desc: "vwap30 / ltp / yahoo (Nikkei)"}
+      atp:          {type: float,    consumers: [DATA], desc: "day average traded price at 15:30 (Fyers atp)"}
+      prev_close:   {type: float,    consumers: [ML, DATA], desc: "previous close as NSE gives it today (differs from history on an ex-date)"}
+      vol_1500:     {type: float,    consumers: [DATA], desc: "day volume at the 15:00 snapshot"}
+      atp_1500:     {type: float,    consumers: [DATA], desc: "average traded price at the 15:00 snapshot"}
+
+  intraday_daily:
+    description: >-
+      One row per stock per day describing HOW the session traded, from the Fyers 1-minute archive (nse_intraday.py;
+      build once, then daily from run_update.bat). All columns are scale-free (returns, shares, positions in the day),
+      so splits do not matter. The newest day exists from the 15:37 at-close build (intraday bars prefetched all day,
+      NSEALGOENGINE prefetch-today); it is ok on the session shape alone until the 19:30 update publishes the official
+      close, then re-checked. Usable by the nightly and the 15:37 forecasts. Use only rows with ok = true.
+      09:15 bar = minute 0, 15:28 = last trade bar,
+      15:29 = official close mark (since 2026); 08-Nov-2023 .. 03-Oct-2025 the 09:15 bar also holds the opening-auction
+      volume (first_bar_auction), so volume shares leave the 09:15 bar out.
+    files: {ref: intraday_daily.parquet}
+    key: [company_id, date]
+    columns:
+      company_id:           {type: string, consumers: [ML, DATA], desc: "minute-archive folder = NSE symbol (joins to raw_ohlcv)"}
+      date:                 {type: date,   consumers: [ML, DATA], desc: "trading day"}
+      ok:                   {type: bool,   consumers: [ML, DATA], desc: "usable: normal session (first bar by 09:45, trading past 15:15), open on the usual minute/NSE price scale (0.5 %), volume within 10 % of the stock's usual minute/NSE ratio; the two NSE checks need the published official close, so the newest day (the 15:37 build) is ok on the session shape alone and is re-checked after the 19:30 update"}
+      n_bars:               {type: int32,  consumers: [DATA], desc: "1-minute bars 09:15-15:29 (375 on a full day)"}
+      id_ret_first30:       {type: float,  consumers: [ML], desc: "ln(price 09:44 / open): first 30 minutes"}
+      id_ret_mid:           {type: float,  consumers: [ML], desc: "ln(price 14:59 / price 09:44): middle of the day"}
+      id_ret_last30:        {type: float,  consumers: [ML], desc: "ln(last trade 15:28 / price 14:59): last 30 minutes"}
+      id_close_mark:        {type: float,  consumers: [ML], desc: "ln(official close / last trade): pull of the 15:00-15:30 closing VWAP"}
+      id_vwap_dev:          {type: float,  consumers: [ML], desc: "ln(official close / day VWAP)"}
+      id_rv5:               {type: float,  consumers: [ML], desc: "realized volatility of 5-minute returns (open -> 15:28), not annualized"}
+      id_bv5:               {type: float,  consumers: [ML], desc: "bipower variation (sqrt), the continuous part of id_rv5"}
+      id_jump_share:        {type: float,  consumers: [ML], desc: "share of the day's variance from jumps: max(0, 1 - bv^2 / rv^2)"}
+      id_down_share:        {type: float,  consumers: [ML], desc: "share of the variance from falling 5-minute blocks"}
+      id_rskew5:            {type: float,  consumers: [ML], desc: "realized skewness of 5-minute returns"}
+      id_rv_first30_share:  {type: float,  consumers: [ML], desc: "share of the variance in 09:15-09:44 (incl. the gap from the open)"}
+      id_rv_last60_share:   {type: float,  consumers: [ML], desc: "share of the variance in 14:30-15:28"}
+      id_hi_time:           {type: float,  consumers: [ML], desc: "when the day's high was made: 0 = 09:15, 1 = 15:28"}
+      id_lo_time:           {type: float,  consumers: [ML], desc: "when the day's low was made: 0 = 09:15, 1 = 15:28"}
+      id_vol_first30:       {type: float,  consumers: [ML], desc: "share of the volume 09:16-09:44 (of 09:16-15:28)"}
+      id_vol_last30:        {type: float,  consumers: [ML], desc: "share of the volume 15:00-15:28 (of 09:16-15:28)"}
+      id_vol_max_bar:       {type: float,  consumers: [ML], desc: "biggest single minute's share of the volume (09:16-15:28)"}
+      id_vol_first_bar:     {type: float,  consumers: [DATA], desc: "09:15 bar share of all minute volume - includes the auction when first_bar_auction; not for models as is"}
+      id_vol_close_bar:     {type: float,  consumers: [ML], desc: "15:29 bar share of all minute volume"}
+      id_no_trade_share:    {type: float,  consumers: [ML], desc: "share of the 374 trading minutes without a trade (or missing)"}
+      id_signed_vol:        {type: float,  consumers: [ML], desc: "(volume of up-minutes - volume of down-minutes) / volume, 09:16-15:28"}
+      id_signed_vol_last30: {type: float,  consumers: [ML], desc: "the same for 15:00-15:28"}
+      id_vol_ratio_nse:     {type: float,  consumers: [DATA], desc: "minute volume total / raw_ohlcv volume (data check; a fixed 0.2-0.6 before a demerger: raw_ohlcv adjusts volume there, Fyers does not)"}
+      px_factor:            {type: float,  consumers: [DATA], desc: "minute price / raw_ohlcv price (median of the last 10 sessions; 1.0 unless the two sources adjusted a corporate action differently)"}
+      first_bar_auction:    {type: bool,   consumers: [ML, DATA], desc: "true 08-Nov-2023 .. 03-Oct-2025: Fyers put the opening-auction volume in the 09:15 bar"}
+
+  features:
+    description: >-
+      Candidate indicator columns for NSEMLENGINE, rebuilt from raw_ohlcv + market on every update
+      (nse_common.features). NSEALGOENGINE does not read this file. Market levels are NOT repeated here -
+      join market.parquet on datetime.
+    files: {master: features_output_clean.parquet, fresh: features_5y.parquet}
+    key: [company_id, datetime]
+    columns:
+      company_id:      {type: string,   consumers: [ML], desc: "key"}
+      datetime:        {type: datetime, consumers: [ML], desc: "key"}
+      open:            {type: float,    consumers: [ML], desc: "adjusted open"}
+      high:            {type: float,    consumers: [ML], desc: "adjusted high"}
+      low:             {type: float,    consumers: [ML], desc: "adjusted low"}
+      close:           {type: float,    consumers: [ML], desc: "adjusted close"}
+      volume:          {type: int,      consumers: [ML], desc: "adjusted volume"}
+      returns:         {type: float,    consumers: [ML], desc: "close / previous close - 1"}
+      roc_5:           {type: float,    consumers: [ML], desc: "5-day % change of close"}
+      roc_10:          {type: float,    consumers: [ML], desc: "10-day % change of close"}
+      rolling_return:  {type: float,    consumers: [ML], desc: "20-day mean daily return"}
+      sma_20:          {type: float,    consumers: [ML], desc: "20-day SMA (ML uses close/sma_20)"}
+      sma_50:          {type: float,    consumers: [ML], desc: "50-day SMA (ML uses close/sma_50)"}
+      sar:             {type: float,    consumers: [ML], desc: "Parabolic SAR (ML uses (close-sar)/atr)"}
+      rolling_max_close: {type: float,  consumers: [ML], desc: "20-day highest close"}
+      rolling_min_close: {type: float,  consumers: [ML], desc: "20-day lowest close"}
+      rsi_14:          {type: float,    consumers: [ML], desc: "RSI 14 (simple-average variant)"}
+      stoch_k:         {type: float,    consumers: [ML], desc: "stochastic %K 14"}
+      cci_20:          {type: float,    consumers: [ML], desc: "CCI 20"}
+      zscore_close:    {type: float,    consumers: [ML], desc: "(close - 20-day mean) / 20-day std"}
+      macd:            {type: float,    consumers: [ML], desc: "EMA12 - EMA26 in rupees (ML divides by close)"}
+      macd_hist:       {type: float,    consumers: [ML], desc: "MACD - 9-day EMA of MACD"}
+      atr_14:          {type: float,    consumers: [ML], desc: "Wilder ATR 14 in rupees"}
+      volatility_5:    {type: float,    consumers: [ML], desc: "5-day std of daily returns"}
+      volatility_20:   {type: float,    consumers: [ML], desc: "20-day std of daily returns"}
+      hl_pct:          {type: float,    consumers: [ML], desc: "(high - low) / close x 100"}
+      volume_ratio:    {type: float,    consumers: [ML], desc: "volume / 20-day mean volume"}
+      volume_sma:      {type: float,    consumers: [ML], desc: "20-day mean volume"}
+      obv:             {type: float,    consumers: [ML], desc: "on-balance volume"}
+      price_range:     {type: float,    consumers: [ML], desc: "(close - low) / (high - low)"}
+      co_ratio:        {type: float,    consumers: [ML], desc: "close / open"}
+      skewness:        {type: float,    consumers: [ML], desc: "20-day skew of CLOSE PRICES (ML recomputes on returns)"}
+      kurtosis:        {type: float,    consumers: [ML], desc: "20-day kurtosis of CLOSE PRICES (ML recomputes on returns)"}
+      sharpe_ratio:    {type: float,    consumers: [ML], desc: "20-day mean / std of daily returns"}
+      beta_60:         {type: float,    consumers: [ML], desc: "60-day beta to Nifty 50"}
+      corr_market:     {type: float,    consumers: [ML], desc: "60-day correlation with Nifty 50 returns"}
+      corr_global:     {type: float,    consumers: [ML], desc: "60-day correlation with S&P 500 returns"}
+      nifty_returns:   {type: float,    consumers: [ML], desc: "Nifty 50 daily return"}
+      global_returns:  {type: float,    consumers: [ML], desc: "S&P 500 daily return (last close on or before the date)"}
+      day_of_week:     {type: int,      consumers: [ML], desc: "Monday = 1 ... Sunday = 7"}
+      month:           {type: int,      consumers: [ML], desc: "1 ... 12"}
+
+# Columns removed from the published files. Never re-add one under the same name with a different meaning.
+retired:
+  - {date: "2026-10-03", dataset: raw_ohlcv, columns: [adj_close], reason: "legacy rows dividend-adjusted, NSE rows = close; meaning changed mid-series; no consumer"}
+  - {date: "2026-10-03", dataset: raw_ohlcv, columns: [sentiment, sentiment_weighted], reason: "always 0 - no sentiment source"}
+  - {date: "2026-10-03", dataset: market, columns: [nifty50, global_close, inr_usd, crude_oil_2, gold_2], reason: "exact copies of nifty_close, sp500, usd_inr, crude_oil, gold"}
+  - {date: "2026-10-03", dataset: features, columns: [adj_close, sentiment, sentiment_lag_1, sentiment_lag_5, sentiment_lag_10, sentiment_weighted], reason: "no meaning / always 0"}
+  - {date: "2026-10-03", dataset: features, columns: [nifty_close, global_close, inr_usd, crude_oil, gold, vix, crude_oil_2, gold_2, usd_inr, sp500, nifty50, ftse100, dax, nikkei225], reason: "market levels repeated on every stock row - read market.parquet"}
+  - {date: "2026-10-03", dataset: features, columns: [vwap, pivot_point, fib_236, fib_382, fib_618, ema_20, wma_20, sma_5, bb_upper, bb_middle, bb_lower, rolling_mean_close, lag_close_1, lag_close_5, lag_close_10], reason: "rupee price levels / linear copies of OHLC - not scale-free, no consumer"}
+  - {date: "2026-10-03", dataset: features, columns: [roc, price_change_pct, hl_spread, hl_range, vol_ratio, hl_ratio, macd_signal, stoch_d, rolling_std_close, rolling_price_range, momentum_raw, price_change, price_accel], reason: "duplicates or rupee-denominated variants of kept columns"}
+  - {date: "2026-10-03", dataset: features, columns: [volume_change, volume_change_pct, price_vol_product, rolling_std_vol, obv_change, lag_vol_1, lag_vol_5, lag_vol_10], reason: "redundant volume transforms - ML derives its own from volume / volume_sma"}
+  - {date: "2026-10-03", dataset: features, columns: [day_name, quarter, week_of_year], reason: "derivable from datetime"}

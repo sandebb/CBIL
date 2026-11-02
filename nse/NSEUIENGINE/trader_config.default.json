@@ -1,0 +1,47 @@
+{
+  "live": true,
+  "capital": 100000,
+  "sizing": "value",
+  "risk_per_trade_pct": 1.0,
+  "regime_risk_multiplier": {
+    "turbulent": 0.5,
+    "crisis": 0.0
+  },
+  "max_portfolio_heat_pct": 6.0,
+  "max_position_pct": 20.0,
+  "min_position_value": 2000,
+  "max_stop_pct": 25.0,
+  "qty_per_trade": 1,
+  "max_price_per_share": 15000,
+  "max_open_positions": 3,
+  "max_new_entries_per_day": 0,
+  "daily_loss_limit": 3000,
+  "stop_entries_drawdown": 10000,
+  "flatten_drawdown": 20000,
+  "strategies": [
+    "pead",
+    "pead_200dma",
+    "pullback",
+    "resid_momentum_200dma_hold63",
+    "skew_premium"
+  ],
+  "min_bt_profit_factor": 1.25,
+  "regime_filter": true,
+  "exclude_symbols": [],
+  "stop_limit_buffer_pct": 2.0,
+  "exit_protection_pct": 5.0,
+  "entry_chase_pct": 0.5,
+  "time_exit_months": 3,
+  "poll_seconds": 20,
+  "require_static_ip": true,
+  "data_python": "python",
+  "nsedataengine_home": "",
+  "est_charges_per_round_trip": 20.0,
+  "value_per_trade": 5000,
+  "allow_symbols": [
+    "HINDUNILVR",
+    "LT",
+    "BRITANNIA"
+  ],
+  "_note": "16 Oct 2026: Fyers trader only manages the 3 open positions to exit; new trades will go through Shoonya"
+}

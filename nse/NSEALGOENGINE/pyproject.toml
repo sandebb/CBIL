@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nsealgo"
+version = "3.11.0"
+description = "Broker-agnostic, regime-aware NSE algorithmic trading system with backtest, forward test and live execution"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26", "pandas>=2.1", "scipy>=1.11", "statsmodels>=0.14", "hmmlearn>=0.3",
+  "PyYAML>=6", "typer>=0.12", "pyotp>=2.9", "requests>=2.31", "plotly>=5.20",
+  "psutil>=5.9", "threadpoolctl>=3.1",
+  "tzdata>=2024.1; sys_platform == 'win32'",   # IANA zones for zoneinfo (Windows ships none)
+]
+
+[project.optional-dependencies]
+# Install ONLY the broker(s) you use: several SDKs pin conflicting versions of requests/pandas/pyjwt.
+zerodha = ["kiteconnect>=5.0"]
+fyers = ["fyers-apiv3>=3.1.19", "pyarrow>=14"]   # 3.1.18 and older corrupt TBT depth diffs
+desk = ["PySide6-Essentials>=6.6", "pyqtgraph>=0.13"]
+shoonya = ["NorenRestApiPy>=0.0.22", "websocket-client>=1.6"]
+upstox = ["upstox-python-sdk>=2.20"]
+angelone = ["smartapi-python>=1.5", "logzero", "websocket-client>=1.6"]
+dhan = ["dhanhq>=2.1"]
+icici = ["breeze-connect>=1.0.60"]
+fivepaisa = ["py5paisa>=0.7.20"]
+aliceblue = ["pya3>=1.0.30"]
+groww = ["growwapi>=1.5"]
+yahoo = ["yfinance>=0.2.40"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+nsealgo = "nsealgo.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning", "ignore::FutureWarning"]

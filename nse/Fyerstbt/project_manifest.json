@@ -1,0 +1,56 @@
+{
+  "manifest_version": 1,
+  "name": "fyerstbt",
+  "description": "Fyerstbt - Fyers TBT 50-level depth for the 15 best signal stocks, one Parquet file per minute",
+  "env_var": "FYERSTBT_HOME",
+  "default_path": "${NSE_ROOT}/code/Fyerstbt",
+  "verify_commands": [],
+  "parts": [
+    {
+      "order": 1,
+      "name": "code",
+      "required": true,
+      "why": "The recorder and its launchers.",
+      "include": [
+        "*.py",
+        "*.bat",
+        "requirements.txt",
+        "project_manifest.json"
+      ]
+    },
+    {
+      "order": 2,
+      "name": "logs",
+      "required": false,
+      "why": "Recorder logs. The recorded Parquet files are in day folders (<yyyymmdd>) here, or under %FYERSTBT_DATA_DIR% if set - copy those separately, they are large.",
+      "include": [
+        "logs\\**"
+      ]
+    },
+    {
+      "order": 3,
+      "name": "recordings",
+      "required": false,
+      "why": "Recorded TBT days (one folder per day, ~40 MB each): research data that cannot be downloaded again.",
+      "include": [
+        "20??????\\**"
+      ]
+    }
+  ],
+  "setup": {
+    "order": 5,
+    "steps": [
+      {
+        "name": "Python packages for the TBT recorder (protobuf, websocket-client, pyarrow)",
+        "run": "python -m pip install --user --disable-pip-version-check -q -r requirements.txt"
+      },
+      {
+        "name": "project registry",
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File \"{datahome}\\migrate\\register_project.ps1\" -ProjectRoot \"{root}\""
+      }
+    ],
+    "verify": [
+      "python fyers_tbt_streamer.py --dry-run"
+    ]
+  }
+}

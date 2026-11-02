@@ -1,0 +1,136 @@
+{
+  "manifest_version": 1,
+  "name": "nsemlengine",
+  "description": "NSEMLENGINE - next-day OHLCV forecasts (DeepLOB adapted to daily data): dataset, walk-forward, baselines, deeplob model",
+  "env_var": "NSEMLENGINE_HOME",
+  "default_path": "${NSE_ROOT}/code/NSEMLENGINE",
+  "verify_commands": [],
+  "parts": [
+    {
+      "order": 1,
+      "name": "code",
+      "required": true,
+      "why": "Package, tests, configuration and setup script.",
+      "include": [
+        "nseml\\*.py",
+        "tests\\*.py",
+        "*.md",
+        "*.yaml",
+        "requirements.txt",
+        "*.ps1",
+        "project_manifest.json",
+        "*.cmd",
+        "*.bat"
+      ]
+    },
+    {
+      "order": 2,
+      "name": "results",
+      "required": false,
+      "why": "Walk-forward results (metrics, summaries, predictions, trained deeplob models).",
+      "include": [
+        "work\\results\\**",
+        "work_alt\\results\\**",
+        "work_alt_close\\results\\**",
+        "work_alt_link\\results\\**",
+        "work_alt_intraday\\results\\**",
+        "work_alt_link\\link_map.json",
+        "work_alt_link\\link_map.txt"
+      ]
+    },
+    {
+      "order": 3,
+      "name": "dataset",
+      "required": false,
+      "regenerable": true,
+      "why": "work\\dataset_v2.parquet - rebuilt in about a minute with 'python -m nseml build'.",
+      "include": [
+        "work\\dataset_v2.parquet"
+      ]
+    },
+    {
+      "order": 4,
+      "name": "live_models",
+      "required": false,
+      "why": "Trained nightly models (work\\live\\**) and the forecasts so far (work\\predictions\\**). Optional: models are retrained automatically when missing.",
+      "include": [
+        "work\\live\\**",
+        "work\\predictions\\**",
+        "work_alt\\live\\**",
+        "work_alt\\predictions\\**",
+        "work_alt_close\\live\\**",
+        "work_alt_close\\predictions\\**",
+        "work_alt_close\\delivery_nowcast.parquet",
+        "work_alt_link\\live\\**",
+        "work_alt_link\\predictions\\**",
+        "work_alt_link\\delivery_nowcast.parquet"
+      ]
+    }
+  ],
+  "setup": {
+    "order": 3,
+    "steps": [
+      {
+        "name": "Python packages",
+        "run": "{python} -m pip install --user --disable-pip-version-check -q -r requirements.txt"
+      },
+      {
+        "name": "environment variables (NSEMLENGINE_HOME, NSEMLENGINE_WORK_DIR)",
+        "when": "nogpu",
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File setup_env.ps1"
+      },
+      {
+        "name": "environment variables + Python 3.12 .venv with PyTorch ROCm for the Radeon GPU (NSEMLENGINE_PYTHON)",
+        "when": "gpu",
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File setup_env.ps1 -Gpu"
+      },
+      {
+        "name": "project registry",
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File \"{datahome}\\migrate\\register_project.ps1\" -ProjectRoot \"{root}\""
+      },
+      {
+        "name": "rebuild the dataset if it was not moved",
+        "when": "always",
+        "run": "if not exist work\\dataset_v2.parquet {python} -m nseml build"
+      },
+      {
+        "name": "scheduled task 'NSEMLENGINE-Predict' (Mon-Fri 20:00, nightly forecasts)",
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File register_tasks.ps1",
+        "task": true
+      },
+      {
+        "name": "scheduled tasks NSEDATAENGINE-AtClose (14:57) + NSEMLENGINE-PredictClose (15:31): at-close forecast, asks for your Windows password",
+        "interactive": true,
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File \"{root}\\register_close_tasks.ps1\"",
+        "task": true
+      },
+      {
+        "name": "scheduled task NSEMLENGINE-PredictAlt (20:40, ALT model with delivery / short selling / MTF inputs; asks for your Windows password)",
+        "interactive": true,
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File \"{root}\\register_alt_task.ps1\"",
+        "task": true
+      },
+      {
+        "name": "scheduled tasks NSEMLENGINE-PredictCloseAlt (15:33) + NSEMLENGINE-PredictAltClose (21:20): ALT-CLOSE model with the delivery nowcast; asks for your Windows password",
+        "interactive": true,
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File \"{root}\\register_alt_close_tasks.ps1\"",
+        "task": true
+      },
+      {
+        "name": "scheduled tasks for the ALT-LINK model (NSEMLENGINE-Predict-alt_link 22:00, NSEMLENGINE-PredictClose-alt_link 15:35); asks for your Windows password",
+        "interactive": true,
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File \"{root}\\register_model_tasks.ps1\" -Model alt_link",
+        "task": true
+      }
+    ],
+    "verify": [
+      "{python} -m nseml paths",
+      "{python} -c \"import torch; print('torch', torch.__version__)\"",
+      "{python} tests\\test_lookahead.py"
+    ],
+    "notes": [
+      "Run commands with nseml.cmd (uses the GPU venv when setup ran with -Gpu), e.g. nseml.cmd predict",
+      "Nightly forecasts: work\\predictions\\latest.csv after the 20:00 task; first run trains the models (about 20-30 min on a CPU)."
+    ]
+  }
+}

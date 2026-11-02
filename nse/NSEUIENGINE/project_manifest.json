@@ -1,0 +1,77 @@
+{
+  "manifest_version": 1,
+  "name": "nseuiengine",
+  "description": "NSEUIENGINE - daily Fyers access token, swing trader, holdings reports",
+  "env_var": "NSEUIENGINE_HOME",
+  "default_path": "${NSE_ROOT}/code/NSEUIENGINE",
+  "verify_commands": [],
+  "parts": [
+    {
+      "order": 1,
+      "name": "code",
+      "required": true,
+      "why": "Scripts, setup scripts and docs.",
+      "include": [
+        "*.py",
+        "*.ps1",
+        "*.md",
+        "requirements.txt",
+        "project_manifest.json",
+        "*.cmd"
+      ]
+    },
+    {
+      "order": 2,
+      "name": "state",
+      "required": false,
+      "why": "Trader config / status, reports and logs. NOT the Fyers secrets file: it is DPAPI-encrypted for this Windows account on this PC and cannot be read on another PC - the setup asks for the credentials again.",
+      "include": [
+        "state\\*.json",
+        "reports\\**",
+        "logs\\**",
+        "state\\*.csv",
+        "state\\ALERTS.txt"
+      ]
+    }
+  ],
+  "setup": {
+    "order": 4,
+    "steps": [
+      {
+        "name": "Fyers credentials (asked again - DPAPI) + .venv, no token yet",
+        "interactive": true,
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File setup_fyers_token.ps1 -NoTask"
+      },
+      {
+        "name": "Fyers first token + task 'NSEUIENGINE-FyersToken' (08:00)",
+        "interactive": true,
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File setup_fyers_token.ps1 -SkipCredentials",
+        "task": true
+      },
+      {
+        "name": "swing trader tasks (NSEUIENGINE-Trader-Morning / -Evening; stays in dry run until live=true)",
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File setup_swing_trader.ps1",
+        "task": true
+      },
+      {
+        "name": "end-of-day tasks: NSEUIENGINE-SignalLog (Mon-Fri 22:00) + NSEUIENGINE-EdgeReport (Sat 10:00)",
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File register_eod_tasks.ps1",
+        "task": true
+      },
+      {
+        "name": "project registry",
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File \"{datahome}\\migrate\\register_project.ps1\" -ProjectRoot \"{root}\""
+      },
+      {
+        "name": "every NSE scheduled task runs whether you are logged on or not (asks your Windows password once)",
+        "interactive": true,
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File make_tasks_run_logged_off.ps1",
+        "task": true
+      }
+    ],
+    "verify": [
+      ".venv\\Scripts\\python.exe fyers_token_manager.py --status",
+      ".venv\\Scripts\\python.exe swing_trader.py status"
+    ]
+  }
+}

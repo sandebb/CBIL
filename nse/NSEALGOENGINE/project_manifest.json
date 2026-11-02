@@ -1,0 +1,92 @@
+{
+  "manifest_version": 1,
+  "name": "nsealgoengine",
+  "description": "NSEALGOENGINE - nsealgo v3.11 trading system (backtest, forward test, live execution)",
+  "env_var": "NSEALGOENGINE_HOME",
+  "default_path": "${NSE_ROOT}/code/NSEALGOENGINE",
+  "verify_commands": [],
+  "parts": [
+    {
+      "order": 1,
+      "name": "source",
+      "required": true,
+      "why": "Source code, tests, configuration, deploy and docs.",
+      "include": [
+        "src\\**",
+        "tests\\**",
+        "config\\**",
+        "deploy\\**",
+        "scripts\\**",
+        "docs\\**",
+        "*.md",
+        "pyproject.toml",
+        ".gitignore",
+        "project_manifest.json"
+      ]
+    },
+    {
+      "order": 2,
+      "name": "state",
+      "required": false,
+      "why": "Local history store, runs, recordings and logs (if any).",
+      "include": [
+        "data\\**",
+        "runs\\**",
+        "recordings\\**",
+        "logs\\**"
+      ]
+    },
+    {
+      "order": 3,
+      "name": "secrets",
+      "required": false,
+      "why": "Broker credentials (.env, incl. TOTP secrets). Moved only if present - keep the bundle private.",
+      "include": [
+        ".env"
+      ]
+    }
+  ],
+  "setup": {
+    "order": 2,
+    "steps": [
+      {
+        "name": ".venv + nsealgo + broker SDKs",
+        "when": "nogpu",
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\windows\\setup.ps1 -Extras \"{algo_extras}\""
+      },
+      {
+        "name": ".venv (Python 3.12) + nsealgo + broker SDKs + PyTorch ROCm for the Radeon GPU",
+        "when": "gpu",
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\windows\\setup.ps1 -Extras \"{algo_extras}\" -Gpu"
+      },
+      {
+        "name": "environment variable + project registry",
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File \"{datahome}\\migrate\\register_project.ps1\" -ProjectRoot \"{root}\""
+      },
+      {
+        "name": "Shoonya order broker: credentials, static-IP check, smoke test (stays dormant until -TestOrder -Enable)",
+        "interactive": true,
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\windows\\setup_shoonya.ps1"
+      },
+      {
+        "name": "forward-test scheduled task 'nsealgo-forward'",
+        "when": "forwardtest",
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File deploy\\windows\\register-tasks.ps1 -DataBroker fyers",
+        "task": true
+      },
+      {
+        "name": "scheduled task 'NSEALGOENGINE-MinuteArchive' (Mon-Fri 19:05, adds the day's 1-minute bars + liquidity table; asks for your Windows password)",
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File deploy\\windows\\register_minute_archive_task.ps1",
+        "task": true
+      }
+    ],
+    "verify": [
+      ".venv\\Scripts\\nsealgo.exe doctor"
+    ],
+    "notes": [
+      "Broker logins need .env (credentials, TOTP secrets): restored only if it was in the bundle.",
+      "Shoonya orders: in market hours run scripts\\windows\\setup_shoonya.ps1 -SkipCredentials -TestOrder -Enable",
+      "1-minute history for research: nsealgo fetch-history --broker fyers --universe liquid_union --minute-universe liquid_union --days 30 --minute-days 125"
+    ]
+  }
+}

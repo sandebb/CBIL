@@ -1,0 +1,185 @@
+{
+  "manifest_version": 1,
+  "about": "Describes what this project needs on a new PC. Used by migrate\\register_project.ps1 (registers the project on this PC), migrate\\pack_project.ps1 (old PC) and unpack_project.ps1 (new PC). Parts are packed and restored in 'order'. 'include' paths are relative to the project folder; 'external' paths are absolute paths on the old PC and are restored under <project>\\archive.",
+  "name": "nsedataengine",
+  "description": "NSEDATAENGINE - NSE equity daily dataset (source of truth for NSEALGOENGINE and NSEMLENGINE): updater (data\\), 5-year fresh build (data_fresh\\), reference data (data_ref\\). Folders and columns: contract\\schema.yaml",
+  "env_var": "NSEDATAENGINE_HOME",
+  "legacy_env_vars": [
+    "NSE_ALGO_HOME"
+  ],
+  "legacy_names": [
+    "nse_data"
+  ],
+  "default_path": "${NSE_ROOT}/code/NSEDATAENGINE",
+  "python_requirements": "requirements.txt",
+  "verify_commands": [
+    "nse_updater.py check"
+  ],
+  "scheduled_task": {
+    "name": "NSE data update",
+    "script": "run_update.bat",
+    "schedule": "WEEKLY",
+    "days": "MON,TUE,WED,THU,FRI",
+    "time": "19:30"
+  },
+  "parts": [
+    {
+      "order": 1,
+      "name": "scripts",
+      "required": true,
+      "why": "All code, settings and the migration tools. Tiny. Includes contract\\schema.yaml, the column contract (source of truth for every parquet column).",
+      "include": [
+        "*.py",
+        "contract\\*.yaml",
+        "*.bat",
+        "project_manifest.json",
+        "requirements.txt",
+        "MIGRATION.md",
+        "migrate\\*.ps1"
+      ]
+    },
+    {
+      "order": 2,
+      "name": "updater_state",
+      "required": true,
+      "why": "Master store (all adjusted prices 1991 -> today), market table and the update logs / corporate-action ledger. Cannot be recreated without the original historical file plus a full re-download.",
+      "include": [
+        "data\\raw_ohlcv.parquet",
+        "data\\market.parquet",
+        "data\\logs\\**"
+      ]
+    },
+    {
+      "order": 3,
+      "name": "fresh_build_state",
+      "required": false,
+      "why": "5-year build from NSE: raw store with original NSE values, market table, audit trail. Recreatable from the cache (part 4) by re-running the build. Also the data_ref datasets (sectors, delivery, deals, insider, surveillance, shareholding, pledge, index_changes): surveillance / pledge / index history exists only here, NSE does not publish it. Also data\\preopen (NSE pre-open snapshots, recorded from the first run - no history exists elsewhere).",
+      "include": [
+        "data_fresh\\raw_ohlcv.parquet",
+        "data_fresh\\market.parquet",
+        "data_fresh\\audit\\**",
+        "data_fresh\\logs\\**",
+        "data_fresh_2019\\raw_ohlcv.parquet",
+        "data_fresh_2019\\market.parquet",
+        "data_fresh_2019\\audit\\**",
+        "data_fresh_2019\\logs\\**",
+        "data_ref\\fno_universe.parquet",
+        "data_ref\\logs\\**",
+        "data_ref\\sectors.parquet",
+        "data_ref\\delivery.parquet",
+        "data_ref\\deals.parquet",
+        "data_ref\\insider.parquet",
+        "data_ref\\surveillance.parquet",
+        "data_ref\\shareholding.parquet",
+        "data_ref\\pledge.parquet",
+        "data_ref\\index_changes.parquet",
+        "data\\preopen\\*.parquet",
+        "data\\at_close\\*.parquet",
+        "data_ref\\short_selling.parquet",
+        "data_ref\\mtf.parquet"
+      ]
+    },
+    {
+      "order": 4,
+      "name": "download_cache",
+      "required": false,
+      "recommended": true,
+      "why": "Every NSE file downloaded so far. Saves hours of re-downloading and protects against NSE removing old files from its archive.",
+      "include": [
+        "data\\cache\\**",
+        "data_fresh\\cache\\**",
+        "data_fresh_2019\\cache\\**",
+        "data_ref\\cache\\**",
+        "data\\events\\**",
+        "data\\preopen\\raw\\**",
+        "data\\at_close\\raw\\**"
+      ]
+    },
+    {
+      "order": 5,
+      "name": "feature_files",
+      "required": false,
+      "regenerable": true,
+      "why": "The large feature files. Rebuilt in a few minutes with 'python nse_updater.py features' / 'python nse_fresh_build.py build', so normally not moved.",
+      "include": [
+        "data\\features_output_clean.parquet",
+        "data_fresh\\features_5y.parquet",
+        "data_fresh_2019\\features_2019.parquet",
+        "data_ref\\intraday_daily.parquet"
+      ]
+    },
+    {
+      "order": 6,
+      "name": "historical_archive",
+      "required": false,
+      "why": "The original files this project started from (needed only to re-run 'init' from scratch). Restored under <project>\\archive.",
+      "external": [
+        "${NSE_ROOT}/data/features_output.parquet",
+        "${NSE_ROOT}/data/features_output_clean.parquet",
+        "${NSE_ROOT}/data/data_quality_report.csv",
+        "${NSE_ROOT}/data/build_features_clean.py"
+      ]
+    }
+  ],
+  "setup": {
+    "order": 1,
+    "about": "Steps run by migrate\\setup_new_pc.ps1 on a new PC, in this folder. {python} = the Python on PATH (the one the scheduled task uses), {root} = this folder, {datahome} = NSEDATAENGINE folder.",
+    "steps": [
+      {
+        "name": "accurate PC clock (Windows Time service, asks for Administrator)",
+        "interactive": true,
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File \"{root}\\migrate\\set_time_sync.ps1\""
+      },
+      {
+        "name": "Wi-Fi card never switched off to save power + startup task PX13-KeepWifiOn (asks for Administrator)",
+        "interactive": true,
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File \"{root}\\migrate\\keep_wifi_on.ps1\" -Register"
+      },
+      {
+        "name": "Python packages",
+        "run": "{python} -m pip install --user --disable-pip-version-check -q -r requirements.txt"
+      },
+      {
+        "name": "environment variables + project registry",
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File \"{root}\\migrate\\register_project.ps1\" -ProjectRoot \"{root}\""
+      },
+      {
+        "name": "scheduled task 'NSE data update'",
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File \"{root}\\migrate\\register_project.ps1\" -ProjectRoot \"{root}\" -ScheduledTask",
+        "task": true
+      },
+      {
+        "name": "scheduled task 'NSEDATAENGINE-PreOpen' (Mon-Fri 08:58, records the pre-open auction; asks for your Windows password)",
+        "interactive": true,
+        "run": "powershell -NoProfile -ExecutionPolicy Bypass -File \"{root}\\migrate\\register_preopen_task.ps1\"",
+        "task": true
+      },
+      {
+        "name": "NSE sector of every stock (data_ref\\sectors.parquet + NSEALGOENGINE sector map)",
+        "run": "{python} nse_sectors.py --force"
+      },
+      {
+        "name": "delivery %, bulk/block deals, insider trades, short selling, margin trading history if not moved (45-90 min)",
+        "run": "if not exist data_ref\\insider.parquet {python} nse_alt_data.py backfill --start 2019-01-01"
+      },
+      {
+        "name": "ASM/GSM lists, shareholding, pledge, index members (today)",
+        "run": "{python} nse_alt_data.py daily"
+      },
+      {
+        "name": "intraday features from the 1-minute archive, if not moved (data_ref\\intraday_daily.parquet, a few minutes)",
+        "run": "{python} nse_intraday.py build --if-missing"
+      }
+    ],
+    "verify": [
+      "{python} nse_contract.py validate",
+      "{python} nse_updater.py check",
+      "{python} nse_alt_data.py show",
+      "{python} nse_preopen.py show",
+      "{python} nse_intraday.py show"
+    ],
+    "notes": [
+      "Feature files are not moved by default: rebuild with 'python nse_updater.py features' (minutes)."
+    ]
+  }
+}

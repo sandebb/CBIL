@@ -1,0 +1,215 @@
+# nsealgo configuration. ${VAR} values are read from the environment or from .env in the project root.
+# Anything omitted falls back to the defaults in src/nsealgo/config.py.
+
+capital: 1000000                  # rupees allocated to this system (sizing is a % of live equity)
+
+broker:
+  execution: paper                # forward tests trade against the paper exchange; `nsealgo live` uses `orders` below
+                                  # (or: multi, several accounts with stock allocation, see accounts/routing below)
+  orders:                         # LIVE: which broker places which orders (`nsealgo live --broker X` overrides both)
+    intraday: shoonya             # MIS orders: fyers | zerodha | upstox | angelone | dhan | shoonya | flattrade | zebu | ...
+    delivery: shoonya             # CNC orders (swing / delivery); defaults to the intraday broker
+  data: fyers                     # (16 Oct 2026: Fyers = market data only, Shoonya = all orders) live data: fyers (up to 5,000 symbols) | upstox | or a comma list of FREE feeds
+                                  # merged by the tick mesh, e.g. shoonya,angelone,fyers
+  brokers:
+    zerodha:   {api_key: "${KITE_API_KEY}", api_secret: "${KITE_API_SECRET}", redirect_uri: "http://127.0.0.1:5000/", algo_id: "${KITE_ALGO_ID:-}"}
+    fyers:
+      client_id: "${FYERS_CLIENT_ID}"
+      secret_key: "${FYERS_SECRET_KEY}"
+      redirect_uri: "http://127.0.0.1:5000/"
+      depth: symbol               # symbol (best bid/ask, up to 5,000 stocks) | depth5 (adds 5 levels; 2,500 stocks)
+      rate_per_minute: 200        # Fyers Standard 200 | Prime 600: every API call is held at 90% of it
+      # static IP (SEBI): API orders must come from the static IP registered with Fyers. With static_ip set, nsealgo
+      # checks the outgoing IP through the proxy before logging in and refuses to trade from any other IP.
+      proxy: "${STATICIP_PROXY:-}"      # http://user:pass@host:port (socks5://... needs: pip install requests[socks])
+      static_ip: "${STATIC_IP:-}"
+      transport: {keepalive_seconds: 45, connect_timeout: 3.05, read_timeout: 10}
+    shoonya:   {user_id: "${SHOONYA_USER}", password: "${SHOONYA_PASSWORD}", totp_secret: "${SHOONYA_TOTP_SECRET}",
+                vendor_code: "${SHOONYA_VENDOR_CODE}", api_secret: "${SHOONYA_API_SECRET}", imei: "nsealgo01",
+                # static IP (SEBI): route this broker's REST calls through your dedicated proxy, e.g. StaticIP.in
+                proxy: "${STATICIP_PROXY:-}",     # http://user:pass@host:port (socks5://... needs: pip install requests[socks])
+                static_ip: "${STATIC_IP:-}",      # the IP registered with Shoonya; set it and nothing trades from any other IP
+                transport: {keepalive_seconds: 45, connect_timeout: 3.05, read_timeout: 10},
+                orders: false}            # DORMANT: kept configured (login, data); never sent an order until orders: true
+    flattrade: {user_id: "${FLATTRADE_USER}", session_token: "${FLATTRADE_TOKEN}", master_url: "${FLATTRADE_MASTER_URL:-}"}
+    zebu:      {user_id: "${ZEBU_USER}", password: "${ZEBU_PASSWORD}", totp_secret: "${ZEBU_TOTP_SECRET}",
+                vendor_code: "${ZEBU_VENDOR_CODE}", api_secret: "${ZEBU_API_SECRET}", master_url: "${ZEBU_MASTER_URL:-}"}
+    upstox:    {api_key: "${UPSTOX_API_KEY}", api_secret: "${UPSTOX_API_SECRET}", redirect_uri: "http://127.0.0.1:5000/",
+                # depth: full = 5 levels for everything; full_d30 = 30 levels (Upstox Plus) for up to 50 NSE stocks
+                depth: {mode: full, symbols: []}}   # with full_d30, the 50 slots then follow feeds.depth_focus
+    angelone:  {api_key: "${ANGEL_API_KEY}", client_code: "${ANGEL_CLIENT_CODE}", pin: "${ANGEL_PIN}", totp_secret: "${ANGEL_TOTP_SECRET}"}
+    dhan:      {client_id: "${DHAN_CLIENT_ID}", access_token: "${DHAN_ACCESS_TOKEN}"}
+    icici:     {api_key: "${ICICI_API_KEY}", api_secret: "${ICICI_API_SECRET}", redirect_uri: "http://127.0.0.1:5000/"}
+    fivepaisa: {app_name: "${FIVEPAISA_APP_NAME}", app_source: "${FIVEPAISA_APP_SOURCE}", user_id: "${FIVEPAISA_USER_ID}",
+                password: "${FIVEPAISA_PASSWORD}", user_key: "${FIVEPAISA_USER_KEY}", encryption_key: "${FIVEPAISA_ENCRYPTION_KEY}",
+                client_code: "${FIVEPAISA_CLIENT_CODE}", pin: "${FIVEPAISA_PIN}", totp_secret: "${FIVEPAISA_TOTP_SECRET}"}
+    kotak:     {consumer_key: "${KOTAK_CONSUMER_KEY}", mobile_number: "${KOTAK_MOBILE}", ucc: "${KOTAK_UCC}",
+                mpin: "${KOTAK_MPIN}", totp_secret: "${KOTAK_TOTP_SECRET}", environment: prod}
+    aliceblue: {user_id: "${ALICE_USER_ID}", api_key: "${ALICE_API_KEY}"}
+    groww:     {api_key: "${GROWW_API_KEY}", totp_secret: "${GROWW_TOTP_SECRET:-}", api_secret: "${GROWW_API_SECRET:-}"}
+
+risk:
+  intraday_cap: 0.005             # max risk per intraday trade (fraction of equity); 1/4-Kelly may choose less
+  swing_cap: 0.01                 # max risk per swing trade
+  books:                          # separate capital budgets (share of capital): sizing, exposure and loss limits
+    intraday: 0.5                 # are measured against each book's own capital
+    swing: 0.5
+  daily_loss_limit: 0.03          # INTRADAY book: halt + flatten at -3% of the intraday book at the open
+  swing_daily_loss_limit: 0.02    # SWING book: no new swing entries for the day at -2% of the swing book
+                                  # (open swing positions keep their stops). Kill switches per book:
+                                  # `nsealgo kill --book intraday|swing|all`, `nsealgo resume --book ...`
+  depth_share: 0.25               # intraday size <= 25% of the quantity resting at the best price
+  mis_margin_frac: 0.2            # intraday margin per rupee of position, for the free-margin cap (live)
+  max_consecutive_losses: 3       # intraday halt after 3 losing trades in a row
+  max_order_value: 2500000        # per-order notional cap: OUR fat-finger guard, not a regulation.
+                                  # Sizing keeps positions below it, so orders are never sliced.
+  es_cap: 0.03                    # portfolio 97.5% one-day expected shortfall cap (swing book)
+
+regime:
+  mode: both                      # hmm | sma200 | both (both = the more cautious of the two)
+  index_key: IDX:NIFTY500
+  vix_key: IDX:INDIAVIX
+
+strategies:                       # set enabled: false to switch one off; any default parameter can be overridden
+  orb:         {enabled: true, universe: fno, top_n: 8, trend_filter: false}      # trend_filter: variance-ratio gate
+  vwap_fade:   {enabled: true, universe: nifty50, reversion_filter: false}  # reversion_filter: VR gate
+  momentum:    {enabled: true, universe: nifty500}
+  pead:        {enabled: true, universe: nifty500}
+  pullback:    {enabled: true, universe: nifty100}
+  forced_flow: {enabled: true}
+  # research sleeves (docs/04-design/STRATEGY_RESEARCH.md): backtest, walk-forward and forward-test before enabling
+  resid_reversion: {enabled: false, universe: fno}   # factor-residual OU (Avellaneda-Lee), long only
+  skew_premium:    {enabled: false, universe: nifty500}   # lottery/skewness premium, weekly, long only
+  # documented strategies from books, papers and forums (docs/05-reference/STRATEGY_CATALOGUE.md): research sleeves
+  turtle:          {enabled: false, universe: fno, entry_n: 55, exit_n: 20}    # Turtle System 2 (20/10 = System 1)
+  supertrend:      {enabled: false, universe: nifty100, period: 10, mult: 3.0}
+  high52:          {enabled: false, universe: nifty500}                        # George & Hwang, monthly
+  low_vol:         {enabled: false, universe: nifty100}                        # low-volatility anomaly, monthly
+  resid_momentum:  {enabled: false, universe: nifty500}                        # Blitz-Huij-Martens, monthly
+  compression_breakout: {enabled: false, universe: fno, setup: nr7}           # nr7 | inside | nr4_inside | narrow_cpr
+  gap_fade:        {enabled: false, universe: nifty50}
+  # quote-driven (docs/03-architecture/MICROSTRUCTURE.md): paper-test with forwardtest or replay; they refuse trades that can't pay costs
+  scalper:         {enabled: false, symbols: ["NSE:SBIN", "NSE:ITC", "NSE:TATASTEEL"], target_ticks: 8, stop_ticks: 5}
+  market_maker:    {enabled: false, symbols: ["NSE:SBIN"], quote_value: 50000, max_inventory_value: 200000}
+
+book:                             # order-book signals for stocks streaming depth (ctx.book; docs/03-architecture/PX13.md part 3)
+  levels: 50                      # deepest level used (Fyers TBT: 50, Upstox full_d30: 30, Fyers/Upstox: 5)
+  decay: 0.5                      # weight of level i is decay**i: 0.5 makes levels beyond ~5 count little;
+                                  # raise it (e.g. 0.8) if `nsealgo book-study` shows deeper levels predict
+  imbalance_levels: 5             # levels in the depth-weighted imbalance
+  window_seconds: 30              # order-flow z-score window
+  absorb_window_seconds: 60       # iceberg detection window
+  max_age_seconds: 5              # older book signals are treated as missing
+
+journal:                          # every signal -> order -> fill, for the desk's strategy windows
+  save: true                      # append to runs/<mode>/journal/<date>.jsonl as it happens (+ <date>.bars.json)
+  modes: [forward, live, replay]  # forward = live data, paper orders: nothing reaches a broker
+
+monitor:                          # read-only data for the trading desk (`nsealgo desk`) during forward/live sessions
+  enabled: true                   # served on 127.0.0.1 only, with a per-session token in runs/<mode>/monitor.json
+  port: 0                         # 0 = any free port (the desk finds it); set a number to pin it
+
+compute:                          # array maths: NumPy always; the GPU (PyTorch on ROCm) per kernel where it wins
+  device: auto                    # auto = measure per kernel and size (`nsealgo gpu`) | cpu = never use the GPU
+  gpu_dtype: float32              # consumer GPUs are slow at float64; results are checked against NumPy first
+
+feeds:                            # tick mesh (used when broker.data lists several brokers)
+  redundancy: 2                   # each instrument streams from 2 feeds; the fastest print wins, repeats are dropped
+  stale_seconds: 20               # a feed silent this long during market hours is failed over
+  record_raw: false               # true = also keep every feed's raw ticks (recordings/raw/) for comparison
+  limits: {}                      # per-feed instrument caps, e.g. {fyers: 5000} if your SDK version allows it
+  record_depth: 5                 # depth levels kept in recordings (30 levels x 50 stocks is ~1 GB/day)
+  depth_focus_seconds: 60         # re-rank deep-book slots: open positions first, then intraday candidates
+  depth_overlay:                  # deeper books from YOUR accounts on top of the main feed's quotes
+    source: none                  # none | fyers_tbt (50 levels, 15 symbols) | upstox (30 levels, Upstox Plus)
+                                  # | fyers_tbt,upstox: deepest first; TBT takes the top of the focus list, Upstox the next
+    upstox_connections: 5         # Upstox Plus: 5 websockets per user (one fewer if Upstox is also the main feed)
+    upstox_per_connection: 50     # full_d30 instruments per websocket (Upstox's Websocket Plus announcement)
+    upstox_max_symbols: 250       # if Upstox enforces 50 per user instead, this is detected and capped automatically
+    verify_seconds: 60            # a websocket silent this long while others stream counts as not served
+    tbt_max_symbols: 15           # Fyers TBT limits (API v3 docs): 3 connections x 5 symbols = 15
+    tbt_connections: 3            # TBT connections per app per user
+    tbt_per_connection: 5         # symbols per TBT connection (market depth)
+    tbt_record: false             # true = every TBT message also goes to parquet in paths.tbt_dir (NSEDATAENGINE\tbt)
+                                  # for scalping research; `nsealgo tbt-record` records without running strategies
+    max_age: 2.0                  # seconds; older books are never merged onto a quote
+  watch: none                     # stream more than the strategies need: none | a universe name | all (every NSE
+                                  # stock: universe-wide book signals; use a feed that allows it, e.g. Fyers 5,000)
+
+gates:                            # paper -> live promotion gates (per strategy)
+  min_trades: 100
+  min_sessions: 20
+  max_dd_multiple: 1.5
+
+notifier:
+  telegram_token: "${TELEGRAM_TOKEN:-}"
+  telegram_chat_id: "${TELEGRAM_CHAT_ID:-}"
+
+session:                          # intraday time rules (14 Oct 2026). Swing / delivery (CNC) trades are exempt.
+  intraday_entry_start: "09:30"   # no intraday entries in the first 15 minutes (too many price swings)
+  no_new_intraday: "14:30"        # last time for a new intraday entry
+  intraday_exit_cas: "14:50"      # strategies start their own intraday exits
+  safety_flatten: "14:53"         # flatten intraday positions in closing-auction stocks
+  intraday_exit_noncas: "14:55"   # flatten every remaining intraday position: all out by 15:00 (exits chase 5 s
+                                  # at a time, so 5 minutes is plenty)
+
+oms:                              # order safety for exchange rules on algo/API orders
+  orders_per_second: 8            # exchange limit is 10/s unless the strategy is registered with the exchange
+  protect_market_orders: true     # unprotected MARKET / SL-M algo orders are rejected since 1 Apr 2026: they are
+  market_protection_pct: 0.005    # sent as marketable LIMIT (+/-0.5% of bid/ask) and stop-LIMIT (1% beyond the
+  stop_limit_pct: 0.01            # trigger) to every broker; zerodha also gets market_protection=-1 (auto)
+  exit_chase_seconds: 5           # an unfilled exit is re-priced after 5 s, 0.2% more aggressive each time,
+  exit_chase_max: 0.02            # capped at 2% (and you are alerted after 5 attempts)
+  entry_ttl_seconds: 90           # partial fills: an intraday LIMIT entry still open after 90 s is cancelled; the
+                                  # shares already bought are kept and stay protected by the stop (re-sized on each fill)
+  min_partial_fraction: 0.0       # e.g. 0.3 = a partial entry under 30% of the intended size is sold again at once
+
+system:                           # Windows 11 integration (no-ops elsewhere); see docs/07-operations/WINDOWS.md
+  keep_awake: session             # session = PC can't sleep during market sessions and backtests | always | off
+  disable_power_throttling: true  # opt out of EcoQoS so a minimised console isn't slowed or parked on E-cores
+  worker_priority: below_normal   # backtest workers yield to the desktop and to a running live engine
+  live_priority: above_normal     # forward/live engine gets the CPU first (HIGH is deliberately not used)
+
+# Several broker accounts for execution (docs/03-architecture/MICROSTRUCTURE.md): set broker.execution to multi and uncomment.
+# Each stock trades at one account (sticky allocation table, `nsealgo accounts`); each account has its own
+# orders/s budget (max 10 unless registered_algo: true), so throughput adds up across accounts.
+# accounts:
+#   main:   {broker: shoonya, orders_per_second: 8, capital: 500000}   # capital: per-broker budget (Rs) for
+#   second: {broker: zerodha, orders_per_second: 8, capital: 300000}   # open positions at that account
+# routing:
+#   pins: {RELIANCE: main}             # optional fixed homes; everything else is balanced by capacity
+#   reassign_idle: true                # move stocks without open positions off an unreachable broker
+
+fragility:                        # market-fragility overlay: absorption ratio (+ MST length, reported)
+  enabled: true
+  universe: nifty50
+  threshold: 1.0                  # standardised absorption-ratio shift that counts as fragile
+  action: report                  # report (log only) | halve (new swing entries) | block (no new swing entries)
+
+parallel:                         # multi-core execution: see docs/03-architecture/PERFORMANCE.md, `nsealgo hardware`, `nsealgo bench`
+  workers: auto                   # auto = one process per physical core (RAM-capped); or a number, e.g. 32 for SMT
+  use_smt: false                  # true = one process per hardware thread (measure with `nsealgo bench` first)
+  split: auto                     # auto = strategy sleeves x period blocks | strategy | none
+  warmup_sessions: 120            # swing blocks start early so positions/state match a continuous run...
+  runoff_sessions: 90             # ...and run on without new entries until their trades finish
+  min_block_daily: 250            # smallest period block for swing sleeves (larger = less warm-up overhead)
+  history_threads: 4              # parallel history downloads (the broker's rate limit still paces requests)
+
+costs:                            # Shoonya (Finvasia) charges, as published Mar 2026 - re-check if they change
+  brokerage:                      # intraday: Rs 5 or 0.03% per executed order, whichever is lower; delivery: Rs 0
+    intraday_flat: 5.0
+    intraday_pct: 0.0003
+    delivery_flat: 0.0
+    delivery_pct: 0.0
+  dp_charge: 10.62                # Rs 9 + 18% GST per scrip on a delivery sell
+# defaults for everything else live in src/nsealgo/config.py, e.g.
+#   exch_eq: 0.0000307            # NSE 0.00297% + IPFT 0.0001% (cash equity)
+
+# Data folders. With the shared data area (one data folder per engine) NSEALGOENGINE_DATA_DIR points to its folder,
+# e.g. C:\NSE\DATA\NSEALGOENGINE; without it everything stays inside this project folder as before.
+paths:
+  data_dir: "${NSE_ROOT}\\data\\NSEALGOENGINE/data"
+  runs_dir: "${NSE_ROOT}\\data\\NSEALGOENGINE/runs"
+  cache_dir: "${NSE_ROOT}\\data\\NSEALGOENGINE/cache"
+  recordings_dir: "${NSE_ROOT}\\data\\NSEALGOENGINE/recordings"
+  tbt_dir: "${NSE_ROOT}\\data\\NSEDATAENGINE\\tbt"   # Fyers TBT recordings (NSEDATAENGINE contract location tbt)

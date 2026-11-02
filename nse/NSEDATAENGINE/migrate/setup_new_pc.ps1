@@ -1,0 +1,260 @@
+<#
+.SYNOPSIS
+    NEW PC: sets up every NSE project (NSEDATAENGINE, NSEALGOENGINE, NSEMLENGINE, NSEUIENGINE) from scratch.
+
+.DESCRIPTION
+    One script for the whole move. Run it in a normal (non-admin) PowerShell window:
+
+        powershell -ExecutionPolicy Bypass -File .\setup_new_pc.ps1
+
+    1. Python      makes sure Python 3.12 is installed (winget, per-user, no admin) and that 'python' is on PATH
+    2. Files       if a migration bundle is next to this script (bundle_manifest.json, made on the old PC by
+                   prepare_move.ps1), checks and unpacks every project into the same folders as before
+                   (or -Root); without a bundle it uses the project folders already under -Root
+    3. Settings    restores the non-path user variables saved on the old PC (STATICIP_PROXY, FYERS_ID, ...)
+    4. Projects    runs each project's own setup steps, read from its project_manifest.json ("setup" block),
+                   in order: packages / virtual environments, environment variables, scheduled tasks
+    5. Verify      runs each project's checks and prints a summary; a full log is written to
+                   %USERPROFILE%\AlgoSetup\setup_<date>.log
+
+    Each project describes its own steps, so a new project or a new step is added in that project's
+    project_manifest.json - this script does not change.
+
+    Interactive on purpose: NSEUIENGINE asks for the Fyers credentials again, because its secrets file is
+    encrypted with Windows DPAPI for the old PC's account and cannot be read on a new PC.
+
+.PARAMETER Root
+    Parent folder of the projects (default C:\temp). With a bundle, projects are unpacked to <Root>\<folder>.
+.PARAMETER Only / Skip
+    Project folder names to include / leave out, e.g. -Skip NSEUIENGINE
+.PARAMETER Gpu
+    NSEALGOENGINE: install PyTorch for the Radeon GPU (needs the AMD "PyTorch on Windows" driver first).
+.PARAMETER ForwardTestTask
+    NSEALGOENGINE: also register the 'nsealgo-forward' scheduled task.
+.PARAMETER AlgoExtras
+    NSEALGOENGINE pip extras (broker SDKs). Default dev,fyers,shoonya,upstox,yahoo
+.PARAMETER NoPythonInstall
+    Do not install Python (use whatever is installed).
+.PARAMETER NoTasks
+    Set everything up but register NO scheduled tasks (and fetch no Fyers token) - use this while the old PC is
+    still the live one, so the two PCs never both trade or both download.
+.PARAMETER TasksOnly
+    Switch-over: only the scheduled-task steps (run after disable_old_pc_tasks.ps1 on the old PC).
+.PARAMETER SettingsFile
+    user_env.json written on the old PC by export_settings.ps1 (default: <Root>\_move\user_env.json if present).
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File .\setup_new_pc.ps1
+.EXAMPLE
+    .\setup_new_pc.ps1 -Root D:\algo -Gpu -Skip NSEUIENGINE
+.EXAMPLE
+    .\setup_new_pc.ps1 -Root D:\NSE -Gpu -NoTasks      (PX13, Oct 2026: set up while the HP is still live)
+    .\setup_new_pc.ps1 -Root D:\NSE -Gpu -TasksOnly    (switch-over day, after the HP's tasks are disabled)
+#>
+[CmdletBinding()]
+param(
+    [string]$Root = 'D:\NSE',
+    [string]$BundleDir,
+    [string[]]$Only = @(),
+    [string[]]$Skip = @(),
+    [switch]$Gpu,
+    [switch]$ForwardTestTask,
+    [string]$AlgoExtras = 'dev,fyers,shoonya,upstox,yahoo',
+    [string]$PythonVersion = '3.12',
+    [switch]$NoPythonInstall,
+    [switch]$NoTasks,
+    [switch]$TasksOnly,
+    [string]$SettingsFile
+)
+if ($NoTasks -and $TasksOnly) { throw '-NoTasks and -TasksOnly exclude each other' }
+$ErrorActionPreference = 'Stop'
+$here = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $BundleDir -and (Test-Path (Join-Path $here 'bundle_manifest.json'))) { $BundleDir = $here }
+$logDir = Join-Path $env:USERPROFILE 'AlgoSetup'
+New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+$logFile = Join-Path $logDir ("setup_" + (Get-Date -Format 'yyyyMMdd_HHmmss') + ".log")
+$summary = New-Object System.Collections.Generic.List[object]
+
+function Log([string]$msg, [string]$color = 'Gray') {
+    Write-Host $msg -ForegroundColor $color
+    Add-Content -Path $logFile -Value ("{0}  {1}" -f (Get-Date -Format s), $msg)
+}
+function Step([string]$project, [string]$name, [string]$status, [string]$detail = '') {
+    $summary.Add([pscustomobject]@{ Project = $project; Step = $name; Status = $status; Detail = $detail })
+}
+function Update-SessionPath {
+    $m = [Environment]::GetEnvironmentVariable('Path', 'Machine'); $u = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $env:Path = (@($m, $u) | Where-Object { $_ }) -join ';'
+}
+function Update-SessionEnv {
+    # pick up variables set for the user by earlier steps (they are not in this window's environment yet)
+    foreach ($scope in 'Machine', 'User') {
+        $vars = [Environment]::GetEnvironmentVariables($scope)
+        foreach ($k in $vars.Keys) { if ($k -ne 'Path') { Set-Item -Path "Env:$k" -Value $vars[$k] } }
+    }
+    Update-SessionPath
+}
+# the real python.exe on PATH (Windows ships a WindowsApps stub that only opens the Store)
+function Get-PathPython {
+    foreach ($c in @(Get-Command python -All -ErrorAction SilentlyContinue)) {
+        if ($c.Source -and $c.Source -notlike '*WindowsApps*') { return $c.Source }
+    }
+    return $null
+}
+function Test-PyLauncher([string]$v) {
+    if (-not (Get-Command py -ErrorAction SilentlyContinue)) { return $false }
+    & py "-$v" -c "print(1)" 2>$null | Out-Null
+    return ($LASTEXITCODE -eq 0)
+}
+# Run one command line in a project folder through cmd.exe (inherits this console, so prompts work).
+# Interactive steps keep the console untouched (prompts must show); other steps also copy their output (and the
+# error text when they fail) into the log, so a FAILED step can be diagnosed from the log afterwards.
+function Invoke-InFolder([string]$folder, [string]$cmdline, [bool]$interactive = $true) {
+    Push-Location $folder
+    try {
+        Add-Content -Path $logFile -Value "    > $cmdline"
+        if ($interactive) {
+            & cmd.exe /d /c $cmdline | Out-Host
+        } else {
+            & cmd.exe /d /c "$cmdline 2>&1" | ForEach-Object { Add-Content -Path $logFile -Value "    | $_"; $_ } | Out-Host
+        }
+        return $LASTEXITCODE
+    } finally { Pop-Location }
+}
+
+Log "=== NSE projects - new PC setup  ($env:COMPUTERNAME, $(Get-Date -Format 'yyyy-MM-dd HH:mm'))" 'Cyan'
+Log "log: $logFile"
+if ($env:OS -ne 'Windows_NT') { throw 'This script sets up Windows (scheduled tasks, user variables).' }
+
+# ---- 1. Python ------------------------------------------------------------------------------------
+Log "`n[1] Python $PythonVersion" 'Cyan'
+if (-not (Test-PyLauncher $PythonVersion) -and -not $NoPythonInstall) {
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        throw "Python $PythonVersion not found and winget is missing. Install Python $PythonVersion from python.org (tick 'Add python.exe to PATH'), then run this again."
+    }
+    $id = "Python.Python.$PythonVersion"
+    Log "  installing $id with winget (per-user) ..."
+    & winget install -e --id $id --scope user --silent --accept-package-agreements --accept-source-agreements `
+        --override "/quiet InstallAllUsers=0 PrependPath=1 Include_launcher=1 Include_pip=1"
+    Update-SessionPath
+    if (-not (Test-PyLauncher $PythonVersion)) { throw "Python $PythonVersion still not found after winget - open a new PowerShell window and run this again." }
+}
+$pathPy = Get-PathPython
+if (-not $pathPy) {
+    # 'python' must exist on PATH: NSEDATAENGINE's scheduled task and NSEMLENGINE run 'python'
+    $exe = (& py "-$PythonVersion" -c "import sys; print(sys.executable)").Trim()
+    $dir = Split-Path $exe
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    [Environment]::SetEnvironmentVariable('Path', ("$dir;$dir\Scripts;" + $userPath).TrimEnd(';'), 'User')
+    Update-SessionPath
+    $pathPy = Get-PathPython
+    Log "  added $dir to the user PATH"
+}
+$pyVer = (& $pathPy -c "import sys; print('%d.%d.%d' % sys.version_info[:3])").Trim()
+Log "  python on PATH: $pathPy ($pyVer)"
+& $pathPy -m pip install --user --disable-pip-version-check -q --upgrade pip | Out-Null
+Step 'PC' 'Python' 'ok' "$pathPy ($pyVer)"
+
+# ---- 2. files -------------------------------------------------------------------------------------
+Log "`n[2] Project files" 'Cyan'
+if ($BundleDir) {
+    $BundleDir = (Resolve-Path $BundleDir).Path
+    $bm = Get-Content (Join-Path $BundleDir 'bundle_manifest.json') -Raw | ConvertFrom-Json
+    $paths = @{}
+    foreach ($p in @($bm.projects)) {
+        $leaf = Split-Path $p.source_path -Leaf
+        $paths[$p.name] = Join-Path $Root $leaf
+    }
+    Log "  bundle $BundleDir (from $($bm.source_computer), $($bm.created)) -> $Root"
+    $unpack = Join-Path $BundleDir 'unpack_project.ps1'
+    & $unpack -BundleDir $BundleDir -Paths $paths -NoScheduledTask -SkipPython
+    Step 'PC' 'unpack bundle' 'ok' "$(@($bm.projects).Count) project(s) -> $Root"
+    $userEnv = Join-Path $BundleDir 'user_env.json'
+} else {
+    Log "  no bundle next to this script - using the project folders under $Root"
+    $userEnv = $null
+}
+if ($SettingsFile) { $userEnv = $SettingsFile }
+elseif (-not $userEnv -and (Test-Path (Join-Path $Root '_move\user_env.json'))) { $userEnv = Join-Path $Root '_move\user_env.json' }
+
+# ---- 3. user variables saved on the old PC ----------------------------------------------------------
+Log "`n[3] User variables from the old PC" 'Cyan'
+if ($TasksOnly) { Log '  -TasksOnly: skipped' }
+elseif ($userEnv -and (Test-Path $userEnv)) {
+    $saved = Get-Content $userEnv -Raw | ConvertFrom-Json
+    $oldRoot = if ($saved.PSObject.Properties['_old_root']) { [string]$saved._old_root } else { 'C:\temp' }
+    foreach ($prop in $saved.PSObject.Properties) {
+        if ($prop.Name.StartsWith('_')) { continue }
+        if ([Environment]::GetEnvironmentVariable($prop.Name, 'User')) { Log "  $($prop.Name): already set - kept"; continue }
+        $val = [string]$prop.Value
+        if ($val -like "$oldRoot*") { $val = $Root + $val.Substring($oldRoot.Length) }     # old folder -> new folder
+        [Environment]::SetEnvironmentVariable($prop.Name, $val, 'User')
+        Log "  $($prop.Name) restored"
+    }
+    Step 'PC' 'user variables' 'ok' (($saved.PSObject.Properties | ForEach-Object Name) -join ', ')
+} else { Log '  none saved (no bundle or no user_env.json)' }
+Update-SessionEnv
+
+# ---- 4 + 5. each project's own setup and checks ---------------------------------------------------
+$projects = @()
+foreach ($mf in @(Get-ChildItem -Path $Root -Directory | ForEach-Object { Join-Path $_.FullName 'project_manifest.json' } | Where-Object { Test-Path $_ })) {
+    $m = Get-Content $mf -Raw | ConvertFrom-Json
+    $folder = Split-Path $mf -Parent
+    $leaf = Split-Path $folder -Leaf
+    if ($Only.Count -and $Only -notcontains $leaf) { continue }
+    if ($Skip -contains $leaf) { Log "  $leaf skipped (-Skip)"; continue }
+    if (-not $m.setup) { Log "  $leaf has no setup steps in project_manifest.json - skipped" 'Yellow'; continue }
+    $order = if ($m.setup.order) { [int]$m.setup.order } else { 99 }
+    $projects += [pscustomobject]@{ Leaf = $leaf; Folder = $folder; M = $m; Order = $order }
+}
+$dataHome = ($projects | Where-Object { $_.M.name -eq 'nsedataengine' } | Select-Object -First 1).Folder
+if (-not $dataHome) { $dataHome = Join-Path $Root 'NSEDATAENGINE' }
+$conditions = @('always', $(if ($Gpu) { 'gpu' } else { 'nogpu' }))
+if ($ForwardTestTask) { $conditions += 'forwardtest' }
+
+foreach ($p in ($projects | Sort-Object Order)) {
+    Log "`n[4] $($p.Leaf) - $($p.M.description)" 'Cyan'
+    $subst = @{ '{python}' = "`"$pathPy`""; '{root}' = $p.Folder; '{datahome}' = $dataHome; '{algo_extras}' = $AlgoExtras }
+    $failed = $false
+    foreach ($s in @($p.M.setup.steps)) {
+        $when = if ($s.when) { $s.when } else { 'always' }
+        if ($conditions -notcontains $when) { continue }
+        $isTask = [bool]($s.PSObject.Properties['task'] -and $s.task)
+        if ($NoTasks -and $isTask) { Log "  - $($s.name): skipped (-NoTasks)" 'Yellow'; Step $p.Leaf $s.name 'ok' 'deferred (-NoTasks)'; continue }
+        if ($TasksOnly -and -not $isTask) { continue }
+        $cmd = [string]$s.run
+        foreach ($k in $subst.Keys) { $cmd = $cmd.Replace($k, $subst[$k]) }
+        Log "  - $($s.name)"
+        $isInteractive = [bool]($s.PSObject.Properties['interactive'] -and $s.interactive)
+        $rc = Invoke-InFolder $p.Folder $cmd $isInteractive
+        Update-SessionEnv
+        if ($rc -ne 0) { Log "    FAILED (exit $rc)" 'Red'; Step $p.Leaf $s.name 'FAILED' "exit $rc"; $failed = $true; break }
+        Step $p.Leaf $s.name 'ok'
+    }
+    Log "[5] $($p.Leaf) checks" 'Cyan'
+    foreach ($v in @($p.M.setup.verify)) {
+        if (-not $v -or $failed) { continue }
+        $cmd = [string]$v
+        foreach ($k in $subst.Keys) { $cmd = $cmd.Replace($k, $subst[$k]) }
+        Log "  - $cmd"
+        $rc = Invoke-InFolder $p.Folder $cmd $false
+        Step $p.Leaf "check: $v" $(if ($rc -eq 0) { 'ok' } else { 'FAILED' }) $(if ($rc -ne 0) { "exit $rc" } else { '' })
+    }
+    foreach ($n in @($p.M.setup.notes)) { if ($n) { Log "  note: $n" 'Yellow' } }
+}
+
+# ---- summary ----------------------------------------------------------------------------------------
+Log "`n=== Summary" 'Cyan'
+$summary | Format-Table -AutoSize | Out-String -Width 220 | ForEach-Object { Log $_ }
+$bad = @($summary | Where-Object Status -ne 'ok')
+if ($bad.Count) {
+    Log "$($bad.Count) step(s) failed - fix them and run this script again (finished steps are safe to repeat)." 'Red'
+    $oldXml = Join-Path $Root '_move\old_pc_tasks_xml'
+    if (@($bad | Where-Object Step -like 'scheduled task*').Count -and (Test-Path $oldXml)) {
+        Log "Scheduled tasks failed: register the old PC's saved tasks instead:  powershell -ExecutionPolicy Bypass -File `"$dataHome\migrate\import_old_pc_tasks.ps1`" -Root $Root" 'Yellow'
+    }
+    exit 1
+}
+Log 'All projects are set up. Open a NEW terminal so the new environment variables are visible there.' 'Green'
+if ($NoTasks) { Log "No scheduled tasks were registered (-NoTasks). Switch-over: on the old PC disable_old_pc_tasks.ps1, then here: setup_new_pc.ps1 -Root $Root -TasksOnly" 'Yellow' }
+Log "Scheduled tasks: Get-ScheduledTask | Where-Object TaskName -cmatch '^(NSE|nsealgo)' | Format-Table TaskName,State"
