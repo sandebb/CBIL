@@ -115,6 +115,7 @@ const RUST_MIGRATIONS: &[(&str, Step)] = &[
         "101_muhurat_2026",
         super::market_calendar::migrate_muhurat_2026,
     ),
+    ("102_multi_account", super::multi_account::migrate),
 ];
 
 /// Run all database migrations

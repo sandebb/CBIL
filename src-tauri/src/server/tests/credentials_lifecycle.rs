@@ -563,6 +563,7 @@ fn save_kite_key(ctx: &AppState) {
         &conn,
         &ctx.security,
         "zerodha",
+        crate::security::crypto::DEFAULT_ACCOUNT,
         crate::db::sqlite::credentials::CredentialUpdate {
             api_key: Some("kiteapikey".into()),
             ..Default::default()
@@ -573,12 +574,17 @@ fn save_kite_key(ctx: &AppState) {
 
 fn kite_key(ctx: &AppState) -> String {
     let conn = ctx.sqlite.conn().unwrap();
-    crate::db::sqlite::credentials::load(&conn, &ctx.security, "zerodha")
-        .unwrap()
-        .unwrap()
-        .api_key
-        .expose()
-        .to_string()
+    crate::db::sqlite::credentials::load(
+        &conn,
+        &ctx.security,
+        "zerodha",
+        crate::security::crypto::DEFAULT_ACCOUNT,
+    )
+    .unwrap()
+    .unwrap()
+    .api_key
+    .expose()
+    .to_string()
 }
 
 /// Sign in as the route does: check the password and, when it opens the
@@ -629,6 +635,7 @@ async fn sec03_a_locked_keychain_never_gets_new_keys() {
             &conn,
             &with,
             "zerodha",
+            crate::security::crypto::DEFAULT_ACCOUNT,
             crate::db::sqlite::credentials::CredentialUpdate {
                 api_key: Some("kiteapikey".into()),
                 ..Default::default()
@@ -1085,9 +1092,14 @@ async fn flow03_a_failed_switch_save_keeps_the_live_session() {
     );
     let conn = h.ctx().sqlite.conn().unwrap();
     assert!(
-        crate::db::sqlite::credentials::load(&conn, &h.ctx().security, "upstox")
-            .unwrap()
-            .is_none(),
+        crate::db::sqlite::credentials::load(
+            &conn,
+            &h.ctx().security,
+            "upstox",
+            crate::security::crypto::DEFAULT_ACCOUNT
+        )
+        .unwrap()
+        .is_none(),
         "keys saved by a switch that failed"
     );
     drop(conn);

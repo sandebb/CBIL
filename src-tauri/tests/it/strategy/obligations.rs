@@ -294,6 +294,7 @@ async fn a_run_recorded_with_a_placeholder_account_is_still_managed_by_its_broke
         &conn,
         &a.ctx.security,
         "zerodha",
+        openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT,
         CredentialUpdate {
             api_key: Some("kitekey".into()),
             api_secret: Some("kitesecret".into()),
@@ -337,6 +338,7 @@ async fn a_run_recorded_with_a_real_account_is_not_exited_through_a_keys_session
         &a.ctx.sqlite.conn().unwrap(),
         &a.ctx.security,
         "zerodha",
+        openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT,
         CredentialUpdate {
             api_key: Some("kitekey".into()),
             api_secret: Some("kitesecret".into()),

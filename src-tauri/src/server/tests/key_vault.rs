@@ -7,6 +7,7 @@
 use super::*;
 use crate::db::sqlite::key_vault::{self, KeychainCleanup, Source};
 use crate::db::sqlite::{api_keys, credentials, user, SqliteDb};
+use crate::security::crypto::DEFAULT_ACCOUNT;
 use crate::security::keystore::{CountingKeyStore, KeyStore, KeyStoreError, DATA_KEY, PEPPER};
 use crate::security::{totp, MoveStep, SignInFrom, Unlocked};
 use crate::services::apikey_service::{ApiKeyService, KeyCheck};
@@ -60,6 +61,7 @@ fn earlier_build_database(dir: &Path, keys: &Unlocked, password: &str) -> String
         &conn,
         &with,
         "zerodha",
+        DEFAULT_ACCOUNT,
         credentials::CredentialUpdate {
             api_key: Some("kiteapikey".into()),
             api_secret: Some("kitesecret".into()),
@@ -136,7 +138,7 @@ fn vault(ctx: &AppState) -> Option<key_vault::VaultRow> {
 
 fn kite_key(ctx: &AppState) -> String {
     let conn = ctx.sqlite.conn().unwrap();
-    credentials::load(&conn, &ctx.security, "zerodha")
+    credentials::load(&conn, &ctx.security, "zerodha", DEFAULT_ACCOUNT)
         .unwrap()
         .unwrap()
         .api_key
@@ -425,7 +427,7 @@ async fn an_unreadable_keychain_offers_retry_and_start_fresh() {
     );
     // Dropped: broker keys (the client id stays), the old API key, TOTP.
     assert!(credentials::list_configured(&c).unwrap().is_empty());
-    let creds = credentials::load(&c, &ctx.security, "zerodha")
+    let creds = credentials::load(&c, &ctx.security, "zerodha", DEFAULT_ACCOUNT)
         .unwrap()
         .unwrap();
     assert!(creds.api_key.is_empty());
@@ -795,6 +797,7 @@ async fn a_new_password_without_the_old_one_drops_only_encrypted_values() {
             &c,
             &ctx.security,
             "zerodha",
+            DEFAULT_ACCOUNT,
             credentials::CredentialUpdate {
                 api_key: Some("kiteapikey".into()),
                 api_secret: Some("kitesecret".into()),
@@ -874,7 +877,7 @@ async fn a_new_password_without_the_old_one_drops_only_encrypted_values() {
     let new_key = api_keys::get_plaintext(&c, &ctx.security).unwrap().unwrap();
     assert_ne!(new_key.expose(), old_key);
     // Gone, and reading them is not an error.
-    let creds = credentials::load(&c, &ctx.security, "zerodha")
+    let creds = credentials::load(&c, &ctx.security, "zerodha", DEFAULT_ACCOUNT)
         .unwrap()
         .unwrap();
     assert!(creds.api_key.is_empty() && creds.api_secret.is_none());

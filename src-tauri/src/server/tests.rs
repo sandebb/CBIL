@@ -105,6 +105,7 @@ impl H {
             &conn,
             &self.ctx().security,
             "zerodha",
+            crate::security::crypto::DEFAULT_ACCOUNT,
             crate::db::sqlite::credentials::CredentialUpdate {
                 api_key: Some("kiteapikey".into()),
                 api_secret: Some("kitesecret".into()),
@@ -1557,6 +1558,7 @@ impl H {
             &conn,
             &self.ctx().security,
             "aliceblue",
+            crate::security::crypto::DEFAULT_ACCOUNT,
             crate::db::sqlite::credentials::CredentialUpdate {
                 api_key: Some("APPCODE".into()),
                 api_secret: Some("absecret".into()),
@@ -1964,6 +1966,7 @@ fn family_harness() -> (TestCtx, Vec<Arc<MockBroker>>) {
                 &conn,
                 &t.ctx.security,
                 b,
+                crate::security::crypto::DEFAULT_ACCOUNT,
                 crate::db::sqlite::credentials::CredentialUpdate {
                     api_key: Some(api_key.into()),
                     api_secret: Some("appsecret".into()),
@@ -2069,6 +2072,7 @@ async fn first_state_less_sign_in_needs_the_saved_client_id() {
             &conn,
             &ctx.security,
             "arrow",
+            crate::security::crypto::DEFAULT_ACCOUNT,
             crate::db::sqlite::credentials::CredentialUpdate {
                 api_key: Some("appid".into()),
                 api_secret: Some("appsecret".into()),
@@ -2505,7 +2509,12 @@ async fn forged_state_less_callbacks_are_refused() {
     let callback = |q: &str| with_session(get(&format!("/shoonya/callback?{}", q)), &cookie, None);
     let stored_user = |ctx: &AppState| {
         let c = ctx.sqlite.conn().unwrap();
-        crate::db::sqlite::auth::last_user_id(&c, "shoonya").unwrap()
+        crate::db::sqlite::auth::last_user_id(
+            &c,
+            "shoonya",
+            crate::security::crypto::DEFAULT_ACCOUNT,
+        )
+        .unwrap()
     };
 
     // The code belongs to another account: refused, nothing stored.

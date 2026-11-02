@@ -356,9 +356,14 @@ mod tests {
             .unwrap());
 
         // Broker credentials re-encrypted with AAD and readable.
-        let creds = crate::db::sqlite::credentials::load(&conn, &ctx.security, "zerodha")
-            .unwrap()
-            .unwrap();
+        let creds = crate::db::sqlite::credentials::load(
+            &conn,
+            &ctx.security,
+            "zerodha",
+            crate::security::crypto::DEFAULT_ACCOUNT,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(creds.api_key.expose(), "brokerkey");
         assert_eq!(creds.api_secret.unwrap().expose(), "brokersecret");
 
@@ -421,9 +426,14 @@ mod tests {
         assert_eq!(ctx2.logs.count_analyzer_logs().unwrap(), 1);
         sign_in(&ctx2);
         let conn = ctx2.sqlite.conn().unwrap();
-        let creds = crate::db::sqlite::credentials::load(&conn, &ctx2.security, "zerodha")
-            .unwrap()
-            .unwrap();
+        let creds = crate::db::sqlite::credentials::load(
+            &conn,
+            &ctx2.security,
+            "zerodha",
+            crate::security::crypto::DEFAULT_ACCOUNT,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(creds.api_key.expose(), "brokerkey");
         drop(conn);
         assert_eq!(store.calls(), 0, "the keychain was called");
@@ -440,6 +450,7 @@ mod tests {
             &conn,
             &sec,
             "fyers",
+            crate::security::crypto::DEFAULT_ACCOUNT,
             crate::db::sqlite::credentials::CredentialUpdate {
                 api_key: Some("KEY-100".into()),
                 api_secret: Some("SECRET".into()),
@@ -452,6 +463,12 @@ mod tests {
             "UPDATE broker_credentials SET api_key_encrypted = api_secret_encrypted, api_key_nonce = api_secret_nonce",
         )
         .unwrap();
-        assert!(crate::db::sqlite::credentials::load(&conn, &sec, "fyers").is_err());
+        assert!(crate::db::sqlite::credentials::load(
+            &conn,
+            &sec,
+            "fyers",
+            crate::security::crypto::DEFAULT_ACCOUNT
+        )
+        .is_err());
     }
 }

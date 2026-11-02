@@ -20,6 +20,7 @@ mod master_swap;
 pub(crate) mod migrations;
 pub mod models;
 pub mod monitor;
+pub mod multi_account;
 pub mod oauth_state;
 pub mod rate_plan;
 pub mod request_count;

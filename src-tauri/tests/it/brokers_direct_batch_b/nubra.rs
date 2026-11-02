@@ -604,6 +604,7 @@ async fn callback_routes_send_and_redeem_the_otp() {
             &conn,
             &ctx.security,
             "nubra",
+            openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT,
             CredentialUpdate {
                 api_key: Some(Secret::new("9999999999")),
                 api_secret: Some(Secret::new("4321")),
@@ -839,6 +840,7 @@ async fn callback_routes_send_and_redeem_the_otp() {
             &conn,
             &ctx.security,
             "nubra",
+            openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT,
             CredentialUpdate {
                 api_key: Some(Secret::new("9999999998")),
                 ..Default::default()

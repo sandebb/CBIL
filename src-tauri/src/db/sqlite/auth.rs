@@ -1,11 +1,13 @@
 //! Stored broker session (web `auth` table equivalent).
 //!
-//! One row per broker. Tokens are AES-256-GCM encrypted with AAD bound to the
-//! broker id. A logout or the 03:00 IST boundary revokes the row
-//! (`is_revoked = 1`) and blanks the ciphertexts, so "expired" can be told
-//! apart from "never connected".
+//! One row per broker account (MULTI_BROKER_PLAN D3). Tokens are
+//! AES-256-GCM encrypted with AAD bound to the broker id and the account
+//! row (the legacy account keeps the v1 binding, so pre-multi-account
+//! ciphertexts still decrypt). A logout or the 03:00 IST boundary revokes
+//! the row (`is_revoked = 1`) and blanks the ciphertexts, so "expired" can
+//! be told apart from "never connected".
 
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::security::crypto::Aad;
 use crate::security::{Secret, SecurityManager};
 use chrono::{DateTime, Utc};
@@ -14,6 +16,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 #[derive(Debug, Clone)]
 pub struct StoredBrokerSession {
     pub broker_id: String,
+    /// The broker account the session is signed in with. Pre-multi-account
+    /// rows are the legacy single account (`DEFAULT_ACCOUNT`).
+    pub account_id: String,
     pub auth_token: Secret,
     pub feed_token: Option<Secret>,
     pub user_id: Option<String>,
@@ -21,8 +26,8 @@ pub struct StoredBrokerSession {
     pub authenticated_at: DateTime<Utc>,
 }
 
-fn aad(column: &str, broker: &str) -> Aad {
-    Aad::new("auth", column, broker)
+fn aad(column: &str, broker: &str, account: &str) -> Aad {
+    Aad::for_account("auth", column, broker, account)
 }
 
 pub fn upsert(
@@ -30,20 +35,24 @@ pub fn upsert(
     security: &SecurityManager,
     s: &StoredBrokerSession,
 ) -> Result<()> {
-    let (auth_ct, auth_nonce) =
-        security.encrypt(s.auth_token.expose(), &aad("auth_token", &s.broker_id))?;
+    let (auth_ct, auth_nonce) = security.encrypt(
+        s.auth_token.expose(),
+        &aad("auth_token", &s.broker_id, &s.account_id),
+    )?;
     let (feed_ct, feed_nonce) = match &s.feed_token {
         Some(f) => {
-            let (c, n) = security.encrypt(f.expose(), &aad("feed_token", &s.broker_id))?;
+            let (c, n) =
+                security.encrypt(f.expose(), &aad("feed_token", &s.broker_id, &s.account_id))?;
             (Some(c), Some(n))
         }
         None => (None, None),
     };
     conn.execute(
-        "INSERT INTO auth (broker_id, auth_token_encrypted, auth_token_nonce, feed_token_encrypted,
-             feed_token_nonce, user_id, user_name, authenticated_at, is_revoked)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)
-         ON CONFLICT(broker_id) DO UPDATE SET
+        "INSERT INTO auth (broker_id, account_id, auth_token_encrypted, auth_token_nonce,
+             feed_token_encrypted, feed_token_nonce, user_id, user_name, authenticated_at,
+             is_revoked)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)
+         ON CONFLICT(broker_id, account_id) DO UPDATE SET
              auth_token_encrypted = excluded.auth_token_encrypted,
              auth_token_nonce = excluded.auth_token_nonce,
              feed_token_encrypted = excluded.feed_token_encrypted,
@@ -55,6 +64,7 @@ pub fn upsert(
              updated_at = datetime('now')",
         params![
             s.broker_id,
+            s.account_id,
             auth_ct,
             auth_nonce,
             feed_ct,
@@ -67,88 +77,107 @@ pub fn upsert(
     Ok(())
 }
 
-/// The most recent non-revoked session, decrypted. Rows that no longer
-/// decrypt (key rotated, tampered) are revoked and skipped.
+/// (broker, account, auth ciphertext + nonce, feed ciphertext + nonce,
+/// user id, user name, authenticated at)
+type RawRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// All stored sessions that may still be resumed, newest first. Rows that
+/// no longer decrypt (key rotated, tampered) or whose time cannot be read
+/// are revoked and skipped.
+pub fn list_active(
+    conn: &Connection,
+    security: &SecurityManager,
+) -> Result<Vec<StoredBrokerSession>> {
+    let rows: Vec<RawRow> = {
+        let mut stmt = conn.prepare(
+            "SELECT broker_id, account_id, auth_token_encrypted, auth_token_nonce,
+                    feed_token_encrypted, feed_token_nonce, user_id, user_name, authenticated_at
+             FROM auth WHERE is_revoked = 0 AND auth_token_encrypted != ''
+             ORDER BY authenticated_at DESC, id DESC",
+        )?;
+        let r = stmt.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+            ))
+        })?;
+        r.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let mut sessions = Vec::with_capacity(rows.len());
+    for (broker, account, ct, nonce, fct, fnonce, user_id, user_name, at) in rows {
+        let Some(authenticated_at) = at
+            .as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc))
+        else {
+            revoke(conn, &broker, &account)?;
+            continue;
+        };
+        let auth_token = match security.decrypt(&ct, &nonce, &aad("auth_token", &broker, &account))
+        {
+            Ok(t) => t,
+            Err(AppError::Locked) => return Err(AppError::Locked),
+            Err(_) => {
+                tracing::warn!(
+                    "Stored broker session for {} ({}) could not be read; revoking",
+                    broker,
+                    account
+                );
+                revoke(conn, &broker, &account)?;
+                continue;
+            }
+        };
+        let feed_token = match (fct, fnonce) {
+            (Some(c), Some(n)) if !c.is_empty() => security
+                .decrypt(&c, &n, &aad("feed_token", &broker, &account))
+                .ok(),
+            _ => None,
+        };
+        sessions.push(StoredBrokerSession {
+            broker_id: broker,
+            account_id: account,
+            auth_token,
+            feed_token,
+            user_id,
+            user_name,
+            authenticated_at,
+        });
+    }
+    Ok(sessions)
+}
+
+/// The most recent non-revoked session, decrypted.
 pub fn latest_active(
     conn: &Connection,
     security: &SecurityManager,
 ) -> Result<Option<StoredBrokerSession>> {
-    type Raw = (
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    );
-    let row: Option<Raw> = conn
-        .query_row(
-            "SELECT broker_id, auth_token_encrypted, auth_token_nonce, feed_token_encrypted,
-                    feed_token_nonce, user_id, user_name, authenticated_at
-             FROM auth WHERE is_revoked = 0 AND auth_token_encrypted != ''
-             ORDER BY authenticated_at DESC LIMIT 1",
-            [],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                ))
-            },
-        )
-        .optional()?;
-    let Some((broker, ct, nonce, fct, fnonce, user_id, user_name, at)) = row else {
-        return Ok(None);
-    };
-    let authenticated_at = at
-        .as_deref()
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|d| d.with_timezone(&Utc));
-    let Some(authenticated_at) = authenticated_at else {
-        revoke(conn, &broker)?;
-        return Ok(None);
-    };
-    let auth_token = match security.decrypt(&ct, &nonce, &aad("auth_token", &broker)) {
-        Ok(t) => t,
-        Err(crate::error::AppError::Locked) => return Err(crate::error::AppError::Locked),
-        Err(_) => {
-            tracing::warn!(
-                "Stored broker session for {} could not be read; revoking",
-                broker
-            );
-            revoke(conn, &broker)?;
-            return Ok(None);
-        }
-    };
-    let feed_token = match (fct, fnonce) {
-        (Some(c), Some(n)) if !c.is_empty() => {
-            security.decrypt(&c, &n, &aad("feed_token", &broker)).ok()
-        }
-        _ => None,
-    };
-    Ok(Some(StoredBrokerSession {
-        broker_id: broker,
-        auth_token,
-        feed_token,
-        user_id,
-        user_name,
-        authenticated_at,
-    }))
+    Ok(list_active(conn, security)?.into_iter().next())
 }
 
-pub fn revoke(conn: &Connection, broker_id: &str) -> Result<()> {
+/// Revoke the stored session of one broker account.
+pub fn revoke(conn: &Connection, broker_id: &str, account_id: &str) -> Result<()> {
     conn.execute(
         "UPDATE auth SET is_revoked = 1, auth_token_encrypted = '', auth_token_nonce = '',
             feed_token_encrypted = NULL, feed_token_nonce = NULL, updated_at = datetime('now')
-         WHERE broker_id = ?1",
-        [broker_id],
+         WHERE broker_id = ?1 AND account_id = ?2",
+        params![broker_id, account_id],
     )?;
     Ok(())
 }
@@ -163,38 +192,42 @@ pub fn revoke_all(conn: &Connection) -> Result<usize> {
 }
 
 /// Revoke the stored sessions authenticated before `boundary` (the daily
-/// boundary, SES-02), except those of brokers `keep` names (continuous
-/// crypto sessions, SES-01). A row whose time cannot be read is revoked.
-/// Returns how many were revoked.
+/// boundary, SES-02), except those `keep` names (continuous crypto
+/// sessions, SES-01). `keep` sees (broker, account). A row whose time
+/// cannot be read is revoked. Returns how many were revoked.
 pub fn revoke_before(
     conn: &Connection,
     boundary: DateTime<Utc>,
-    keep: impl Fn(&str) -> bool,
+    keep: impl Fn(&str, &str) -> bool,
 ) -> Result<usize> {
-    let rows: Vec<(String, Option<String>)> = conn
-        .prepare("SELECT broker_id, authenticated_at FROM auth WHERE is_revoked = 0")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+    let rows: Vec<(String, String, Option<String>)> = conn
+        .prepare("SELECT broker_id, account_id, authenticated_at FROM auth WHERE is_revoked = 0")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<std::result::Result<_, _>>()?;
     let mut n = 0;
-    for (broker, at) in rows {
+    for (broker, account, at) in rows {
         let before = at
             .and_then(|a| DateTime::parse_from_rfc3339(&a).ok())
             .is_none_or(|a| a.with_timezone(&Utc) < boundary);
-        if before && !keep(&broker) {
-            revoke(conn, &broker)?;
+        if before && !keep(&broker, &account) {
+            revoke(conn, &broker, &account)?;
             n += 1;
         }
     }
     Ok(n)
 }
 
-/// The broker account id of the last session with `broker_id`, revoked or
-/// not (the account a new sign-in is expected to belong to).
-pub fn last_user_id(conn: &Connection, broker_id: &str) -> Result<Option<String>> {
+/// The broker account id of the last session with `(broker_id, account_id)`,
+/// revoked or not (the account a new sign-in is expected to belong to).
+pub fn last_user_id(
+    conn: &Connection,
+    broker_id: &str,
+    account_id: &str,
+) -> Result<Option<String>> {
     Ok(conn
         .query_row(
-            "SELECT user_id FROM auth WHERE broker_id = ?1",
-            [broker_id],
+            "SELECT user_id FROM auth WHERE broker_id = ?1 AND account_id = ?2",
+            params![broker_id, account_id],
             |r| r.get::<_, Option<String>>(0),
         )
         .optional()?
@@ -202,13 +235,13 @@ pub fn last_user_id(conn: &Connection, broker_id: &str) -> Result<Option<String>
         .filter(|u| !u.trim().is_empty()))
 }
 
-/// Forget the account an ended session with `broker_id` was for, so the
-/// next sign-in may be for another account (the trader saved that
-/// broker's settings again). A live session keeps its account.
-pub fn forget_account(conn: &Connection, broker_id: &str) -> Result<()> {
+/// Forget the account an ended session with `(broker_id, account_id)` was
+/// for, so the next sign-in may be for another account (the trader saved
+/// that key set again). A live session keeps its account.
+pub fn forget_account(conn: &Connection, broker_id: &str, account_id: &str) -> Result<()> {
     conn.execute(
-        "UPDATE auth SET user_id = NULL WHERE broker_id = ?1 AND is_revoked = 1",
-        [broker_id],
+        "UPDATE auth SET user_id = NULL WHERE broker_id = ?1 AND account_id = ?2 AND is_revoked = 1",
+        params![broker_id, account_id],
     )?;
     Ok(())
 }
@@ -221,9 +254,19 @@ pub fn has_revoked(conn: &Connection) -> Result<bool> {
     Ok(n > 0)
 }
 
-/// Remove the stored session row of one broker (forgetting the broker).
+/// Remove the stored session rows of one broker (all its accounts), as when
+/// the broker is forgotten.
 pub fn delete(conn: &Connection, broker_id: &str) -> Result<()> {
     conn.execute("DELETE FROM auth WHERE broker_id = ?1", [broker_id])?;
+    Ok(())
+}
+
+/// Remove the stored session of one broker account.
+pub fn delete_account(conn: &Connection, broker_id: &str, account_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM auth WHERE broker_id = ?1 AND account_id = ?2",
+        params![broker_id, account_id],
+    )?;
     Ok(())
 }
 

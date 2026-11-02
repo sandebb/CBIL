@@ -26,6 +26,7 @@
 //! (`LiveOwner::same_session`).
 
 use crate::db::sqlite::credentials::{self, BrokerCredentialSet};
+use crate::security::crypto::DEFAULT_ACCOUNT;
 use crate::state::{AppState, BrokerSession};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
@@ -85,10 +86,12 @@ pub fn told(ctx: &AppState, session: &BrokerSession) -> Told {
             return told.clone();
         }
     }
+    // Single-session core: the session's keys are the default account's
+    // until the runtime carries an account (MULTI_BROKER_PLAN D3).
     let saved = ctx
         .sqlite
         .conn()
-        .and_then(|c| credentials::load(&c, &ctx.security, &session.broker_id));
+        .and_then(|c| credentials::load(&c, &ctx.security, &session.broker_id, DEFAULT_ACCOUNT));
     let told = match saved {
         Ok(Some(keys)) if !keys.api_key.is_empty() => by_keys(ctx, session, &keys),
         // No saved keys at all (a session installed by a test): the broker's

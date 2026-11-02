@@ -5,6 +5,7 @@
 use super::*;
 use crate::brokers::catalog;
 use crate::db::sqlite::credentials::{self, CredentialUpdate};
+use crate::security::crypto::DEFAULT_ACCOUNT;
 use crate::services::broker_auth_service::FormLogin;
 use crate::services::broker_config_service::BrokerConfigService;
 
@@ -69,7 +70,7 @@ fn field<'a>(b: &'a Value, key: &str) -> &'a Value {
 
 fn stored(h: &H, broker: &str) -> Option<credentials::BrokerCredentialSet> {
     let conn = h.ctx().sqlite.conn().unwrap();
-    credentials::load(&conn, &h.ctx().security, broker).unwrap()
+    credentials::load(&conn, &h.ctx().security, broker, DEFAULT_ACCOUNT).unwrap()
 }
 
 async fn save(h: &H, cookie: &str, csrf: &str, broker: &str, body: Value) -> (StatusCode, Value) {
@@ -616,6 +617,7 @@ fn two_brokers() -> (TestCtx, Arc<MockBroker>, Arc<MockBroker>) {
             &conn,
             &t.ctx.security,
             b,
+            DEFAULT_ACCOUNT,
             CredentialUpdate {
                 api_key: Some(format!("{}key", b).into()),
                 api_secret: Some("secret".into()),
@@ -671,9 +673,11 @@ async fn a_sign_in_ends_any_other_brokers_session_first() {
     assert_eq!(ctx.runtime.active_broker().as_deref(), Some("samco"));
     assert_eq!(*angel.logouts.lock(), 1, "angel's streaming stopped");
     let conn = ctx.sqlite.conn().unwrap();
-    assert!(credentials::load(&conn, &ctx.security, "angel")
-        .unwrap()
-        .is_some());
+    assert!(
+        credentials::load(&conn, &ctx.security, "angel", DEFAULT_ACCOUNT)
+            .unwrap()
+            .is_some()
+    );
 }
 
 /// Two sign-ins that complete at the same moment never leave two sessions:
@@ -749,6 +753,7 @@ fn switch_harness() -> (H, String, String) {
         &conn,
         &h.ctx().security,
         "angel",
+        DEFAULT_ACCOUNT,
         CredentialUpdate {
             api_key: Some("smartkey".into()),
             ..Default::default()
@@ -1002,7 +1007,7 @@ async fn flow04_new_keys_forget_the_old_account() {
     assert_eq!(s, StatusCode::OK, "{v}");
     let conn = h.ctx().sqlite.conn().unwrap();
     assert_eq!(
-        crate::db::sqlite::auth::last_user_id(&conn, "zerodha").unwrap(),
+        crate::db::sqlite::auth::last_user_id(&conn, "zerodha", DEFAULT_ACCOUNT).unwrap(),
         None
     );
 }

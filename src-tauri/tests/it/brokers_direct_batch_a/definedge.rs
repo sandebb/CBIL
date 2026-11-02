@@ -221,6 +221,7 @@ async fn login_page_sends_the_otp_only_when_opened_from_openalgo() {
             &conn,
             &ctx.security,
             "definedge",
+            openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT,
             CredentialUpdate {
                 api_key: Some(Secret::new(TOKEN)),
                 api_secret: Some(Secret::new(SECRET)),

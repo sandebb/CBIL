@@ -34,6 +34,7 @@ use crate::brokers::{catalog, BrokerCredentials};
 use crate::db::sqlite::{auth, credentials, oauth_state};
 use crate::error::{AppError, Result};
 use crate::events::{Event, SessionEndReason};
+use crate::security::crypto::DEFAULT_ACCOUNT;
 use crate::security::Secret;
 use crate::session::web::random_token;
 use crate::state::{AppState, BrokerSession};
@@ -158,7 +159,9 @@ impl BrokerAuthService {
         broker: &str,
     ) -> Result<credentials::BrokerCredentialSet> {
         let conn = state.sqlite.conn()?;
-        credentials::load(&conn, &state.security, broker)?
+        // Multi-session: the session signs in with the default account's
+        // keys until the accounts UI names one (MULTI_BROKER_PLAN D3).
+        credentials::load(&conn, &state.security, broker, DEFAULT_ACCOUNT)?
             .filter(|c| !c.api_key.is_empty())
             .ok_or_else(|| {
                 AppError::Validation(
@@ -384,7 +387,7 @@ impl BrokerAuthService {
         }
         let last = {
             let conn = state.sqlite.conn()?;
-            auth::last_user_id(&conn, broker)?
+            auth::last_user_id(&conn, broker, DEFAULT_ACCOUNT)?
         };
         match last {
             Some(u) => Ok(Some(u)),
@@ -639,6 +642,9 @@ impl BrokerAuthService {
                 &state.security,
                 &auth::StoredBrokerSession {
                     broker_id: s.broker_id.clone(),
+                    // Single-session core: every session is the default
+                    // account until the runtime carries one (D3).
+                    account_id: DEFAULT_ACCOUNT.to_string(),
                     auth_token: s.auth_token.clone(),
                     feed_token: s.feed_token.clone(),
                     user_id: Some(s.user_id.clone()),
@@ -718,7 +724,7 @@ impl BrokerAuthService {
             )
         {
             let conn = state.sqlite.conn()?;
-            auth::revoke(&conn, &stored.broker_id)?;
+            auth::revoke(&conn, &stored.broker_id, &stored.account_id)?;
             return Ok(None);
         }
         Ok(Some(stored))
@@ -733,7 +739,12 @@ impl BrokerAuthService {
         };
         let stored_creds = {
             let conn = state.sqlite.conn()?;
-            credentials::load(&conn, &state.security, &stored.broker_id)?
+            credentials::load(
+                &conn,
+                &state.security,
+                &stored.broker_id,
+                &stored.account_id,
+            )?
         };
         if let Some(c) = &stored_creds {
             broker.restore_session(&Self::stored_input(c));

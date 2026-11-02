@@ -1,9 +1,11 @@
 //! Broker app credentials (what the web keeps in `.env` as BROKER_API_KEY,
-//! BROKER_API_SECRET and the market-data pair), one set per broker.
-//! Encrypted per column with AAD bound to the broker id. Never returned to
-//! the UI in plaintext; the masked form mirrors the web's `mask_secret`, and
-//! the Broker Configuration page shows [`hint`]. The broker's redirect URL,
-//! when the trader set one, is kept with its keys (not a secret).
+//! BROKER_API_SECRET and the market-data pair), one set per broker account
+//! (MULTI_BROKER_PLAN D3). Encrypted per column with AAD bound to the
+//! broker id and the account row (the legacy account keeps the v1 binding,
+//! so pre-multi-account ciphertexts still decrypt). Never returned to the
+//! UI in plaintext; the masked form mirrors the web's `mask_secret`, and
+//! the Broker Configuration page shows [`hint`]. The broker's redirect
+//! URL, when the trader set one, is kept with its keys (not a secret).
 
 use crate::error::Result;
 use crate::security::crypto::Aad;
@@ -33,8 +35,8 @@ pub struct CredentialUpdate {
     pub client_id: Option<String>,
 }
 
-fn aad(column: &str, broker: &str) -> Aad {
-    Aad::new("broker_credentials", column, broker)
+fn aad(column: &str, broker: &str, account: &str) -> Aad {
+    Aad::for_account("broker_credentials", column, broker, account)
 }
 
 /// What the Broker Configuration page shows of a saved value: the first and
@@ -72,10 +74,11 @@ fn enc(
     value: &Option<Secret>,
     column: &str,
     broker: &str,
+    account: &str,
 ) -> Result<(Option<String>, Option<String>)> {
     match value {
         Some(v) if !v.is_empty() => {
-            let (c, n) = security.encrypt(v.expose(), &aad(column, broker))?;
+            let (c, n) = security.encrypt(v.expose(), &aad(column, broker, account))?;
             Ok((Some(c), Some(n)))
         }
         _ => Ok((None, None)),
@@ -88,11 +91,14 @@ fn dec(
     nonce: Option<String>,
     column: &str,
     broker: &str,
+    account: &str,
 ) -> Result<Option<Secret>> {
     match (ct, nonce) {
-        (Some(c), Some(n)) if !c.is_empty() => {
-            Ok(Some(security.decrypt(&c, &n, &aad(column, broker))?))
-        }
+        (Some(c), Some(n)) if !c.is_empty() => Ok(Some(security.decrypt(
+            &c,
+            &n,
+            &aad(column, broker, account),
+        )?)),
         _ => Ok(None),
     }
 }
@@ -101,6 +107,7 @@ pub fn load(
     conn: &Connection,
     security: &SecurityManager,
     broker: &str,
+    account: &str,
 ) -> Result<Option<BrokerCredentialSet>> {
     type Raw = (
         Option<String>,
@@ -120,8 +127,8 @@ pub fn load(
                     api_key_market_encrypted, api_key_market_nonce,
                     api_secret_market_encrypted, api_secret_market_nonce, client_id,
                     redirect_url
-             FROM broker_credentials WHERE broker_id = ?1",
-            [broker],
+             FROM broker_credentials WHERE broker_id = ?1 AND account_id = ?2",
+            params![broker, account],
             |r| {
                 Ok((
                     r.get(0)?,
@@ -142,23 +149,24 @@ pub fn load(
         return Ok(None);
     };
     Ok(Some(BrokerCredentialSet {
-        api_key: dec(security, k, kn, "api_key", broker)?.unwrap_or_default(),
-        api_secret: dec(security, s, sn, "api_secret", broker)?,
-        api_key_market: dec(security, km, kmn, "api_key_market", broker)?,
-        api_secret_market: dec(security, sm, smn, "api_secret_market", broker)?,
+        api_key: dec(security, k, kn, "api_key", broker, account)?.unwrap_or_default(),
+        api_secret: dec(security, s, sn, "api_secret", broker, account)?,
+        api_key_market: dec(security, km, kmn, "api_key_market", broker, account)?,
+        api_secret_market: dec(security, sm, smn, "api_secret_market", broker, account)?,
         client_id,
         redirect_url: redirect_url.filter(|u: &String| !u.trim().is_empty()),
     }))
 }
 
-/// Merge `update` into what is stored for `broker`.
+/// Merge `update` into what is stored for `(broker, account)`.
 pub fn save(
     conn: &Connection,
     security: &SecurityManager,
     broker: &str,
+    account: &str,
     update: CredentialUpdate,
 ) -> Result<()> {
-    let current = load(conn, security, broker)?.unwrap_or_default();
+    let current = load(conn, security, broker, account)?.unwrap_or_default();
     let merged = BrokerCredentialSet {
         api_key: update.api_key.unwrap_or(current.api_key),
         api_secret: update.api_secret.or(current.api_secret),
@@ -167,21 +175,34 @@ pub fn save(
         client_id: update.client_id.or(current.client_id),
         redirect_url: current.redirect_url,
     };
-    let (k, kn) = enc(security, &Some(merged.api_key.clone()), "api_key", broker)?;
-    let (s, sn) = enc(security, &merged.api_secret, "api_secret", broker)?;
-    let (km, kmn) = enc(security, &merged.api_key_market, "api_key_market", broker)?;
+    let (k, kn) = enc(
+        security,
+        &Some(merged.api_key.clone()),
+        "api_key",
+        broker,
+        account,
+    )?;
+    let (s, sn) = enc(security, &merged.api_secret, "api_secret", broker, account)?;
+    let (km, kmn) = enc(
+        security,
+        &merged.api_key_market,
+        "api_key_market",
+        broker,
+        account,
+    )?;
     let (sm, smn) = enc(
         security,
         &merged.api_secret_market,
         "api_secret_market",
         broker,
+        account,
     )?;
     conn.execute(
-        "INSERT INTO broker_credentials (broker_id, api_key_encrypted, api_key_nonce,
+        "INSERT INTO broker_credentials (broker_id, account_id, api_key_encrypted, api_key_nonce,
              api_secret_encrypted, api_secret_nonce, api_key_market_encrypted, api_key_market_nonce,
              api_secret_market_encrypted, api_secret_market_nonce, client_id, updated_at)
-         VALUES (?1, COALESCE(?2, ''), COALESCE(?3, ''), ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))
-         ON CONFLICT(broker_id) DO UPDATE SET
+         VALUES (?1, ?2, COALESCE(?3, ''), COALESCE(?4, ''), ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'))
+         ON CONFLICT(broker_id, account_id) DO UPDATE SET
              api_key_encrypted = excluded.api_key_encrypted,
              api_key_nonce = excluded.api_key_nonce,
              api_secret_encrypted = excluded.api_secret_encrypted,
@@ -192,8 +213,10 @@ pub fn save(
              api_secret_market_nonce = excluded.api_secret_market_nonce,
              client_id = excluded.client_id,
              updated_at = datetime('now')",
-        params![broker, k, kn, s, sn, km, kmn, sm, smn, merged.client_id],
+        params![broker, account, k, kn, s, sn, km, kmn, sm, smn, merged.client_id],
     )?;
+    // `configured_brokers` stays per broker: it tells the pages which
+    // brokers have any keys at all, whatever their accounts.
     conn.execute(
         "INSERT OR REPLACE INTO configured_brokers (broker_id) VALUES (?1)",
         [broker],
@@ -201,36 +224,55 @@ pub fn save(
     Ok(())
 }
 
-/// Brokers that have an API key saved, sorted by name. Credentials are kept
-/// per broker, so switching back to one needs no re-entry.
-pub fn list_configured(conn: &Connection) -> Result<Vec<String>> {
+/// The broker accounts with a saved API key, as (broker, account) pairs,
+/// sorted by broker then account. Credentials are kept per broker account,
+/// so switching back to one needs no re-entry.
+pub fn list_configured(conn: &Connection) -> Result<Vec<(String, String)>> {
     let mut stmt = conn.prepare(
-        "SELECT broker_id FROM broker_credentials
+        "SELECT broker_id, account_id FROM broker_credentials
          WHERE api_key_encrypted IS NOT NULL AND api_key_encrypted <> ''
-         ORDER BY broker_id",
+         ORDER BY broker_id, account_id",
     )?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
-/// Set the redirect URL kept with a broker's keys; `None` (or empty) goes
-/// back to the automatic one. The broker's keys must already be saved.
-pub fn set_redirect_url(conn: &Connection, broker: &str, url: Option<&str>) -> Result<()> {
+/// The accounts of one broker with saved keys, sorted.
+pub fn accounts_for_broker(conn: &Connection, broker: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT account_id FROM broker_credentials
+         WHERE broker_id = ?1 AND api_key_encrypted IS NOT NULL AND api_key_encrypted <> ''
+         ORDER BY account_id",
+    )?;
+    let rows = stmt.query_map(params![broker], |r| r.get::<_, String>(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Set the redirect URL kept with a broker account's keys; `None` (or
+/// empty) goes back to the automatic one. The broker's keys must already
+/// be saved.
+pub fn set_redirect_url(
+    conn: &Connection,
+    broker: &str,
+    account: &str,
+    url: Option<&str>,
+) -> Result<()> {
     let url = url.map(str::trim).filter(|u| !u.is_empty());
     conn.execute(
-        "UPDATE broker_credentials SET redirect_url = ?2, updated_at = datetime('now')
-         WHERE broker_id = ?1",
-        params![broker, url],
+        "UPDATE broker_credentials SET redirect_url = ?3, updated_at = datetime('now')
+         WHERE broker_id = ?1 AND account_id = ?2",
+        params![broker, account, url],
     )?;
     Ok(())
 }
 
-/// The redirect URL saved with a broker's keys, without decrypting them.
-pub fn redirect_url(conn: &Connection, broker: &str) -> Result<Option<String>> {
+/// The redirect URL saved with a broker account's keys, without decrypting
+/// them.
+pub fn redirect_url(conn: &Connection, broker: &str, account: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row(
-            "SELECT redirect_url FROM broker_credentials WHERE broker_id = ?1",
-            [broker],
+            "SELECT redirect_url FROM broker_credentials WHERE broker_id = ?1 AND account_id = ?2",
+            params![broker, account],
             |r| r.get::<_, Option<String>>(0),
         )
         .optional()?
@@ -238,6 +280,7 @@ pub fn redirect_url(conn: &Connection, broker: &str) -> Result<Option<String>> {
         .filter(|u| !u.trim().is_empty()))
 }
 
+/// Forget every key set of `broker` (all its accounts).
 pub fn delete(conn: &Connection, broker: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM broker_credentials WHERE broker_id = ?1",
@@ -246,6 +289,21 @@ pub fn delete(conn: &Connection, broker: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM configured_brokers WHERE broker_id = ?1",
         [broker],
+    )?;
+    Ok(())
+}
+
+/// Forget one broker account's key set. The broker is forgotten for good
+/// only when its last account goes.
+pub fn delete_account(conn: &Connection, broker: &str, account: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM broker_credentials WHERE broker_id = ?1 AND account_id = ?2",
+        params![broker, account],
+    )?;
+    conn.execute(
+        "DELETE FROM configured_brokers WHERE broker_id = ?1
+         AND NOT EXISTS (SELECT 1 FROM broker_credentials WHERE broker_id = ?1)",
+        params![broker],
     )?;
     Ok(())
 }
@@ -296,6 +354,7 @@ impl BrokerCredentialSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::crypto::DEFAULT_ACCOUNT;
 
     #[test]
     fn hint_shows_at_most_six_characters_and_never_half_the_value() {
@@ -315,5 +374,11 @@ mod tests {
         assert_eq!(mask("abc", 6), "********");
         assert_eq!(mask("abcdefghij", 6), "abcdef********");
         assert_eq!(mask("abcdefghijklmnopqrstuvwxyz", 4), "abcd********");
+    }
+
+    /// The default account is the legacy single account.
+    #[test]
+    fn the_default_account_is_named() {
+        assert_eq!(DEFAULT_ACCOUNT, "default");
     }
 }

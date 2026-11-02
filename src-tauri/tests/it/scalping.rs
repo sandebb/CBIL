@@ -3136,6 +3136,7 @@ async fn a_stop_recorded_with_a_placeholder_account_is_exited_through_its_broker
         &conn,
         &h.ctx.security,
         "zerodha",
+        openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT,
         CredentialUpdate {
             api_key: Some("kitekey".into()),
             api_secret: Some("kitesecret".into()),

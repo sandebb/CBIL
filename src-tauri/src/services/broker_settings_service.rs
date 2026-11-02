@@ -11,6 +11,7 @@ use crate::config::{ServerConfig, ServerConfigUpdate};
 use crate::db::sqlite::credentials::{self, CredentialUpdate, MaskedCredentials};
 use crate::error::{AppError, Result};
 use crate::events::SessionEndReason;
+use crate::security::crypto::DEFAULT_ACCOUNT;
 use crate::services::broker_auth_service::BrokerAuthService;
 use crate::services::broker_config_service::BrokerConfigService;
 use crate::state::AppState;
@@ -211,15 +212,21 @@ pub fn masked(state: &AppState, broker: &str) -> Result<(MaskedCredentials, Opti
         return Ok((MaskedCredentials::default(), None));
     }
     let conn = state.sqlite.conn()?;
-    Ok(credentials::load(&conn, &state.security, broker)?
-        .map(|s| (s.masked(), s.client_id))
-        .unwrap_or_default())
+    Ok(
+        credentials::load(&conn, &state.security, broker, DEFAULT_ACCOUNT)?
+            .map(|s| (s.masked(), s.client_id))
+            .unwrap_or_default(),
+    )
 }
 
-/// Every broker with saved keys.
+/// Every broker with saved keys, by id (the web contract names brokers,
+/// not their accounts).
 pub fn configured(state: &AppState) -> Result<Vec<String>> {
     let conn = state.sqlite.conn()?;
-    credentials::list_configured(&conn)
+    Ok(credentials::list_configured(&conn)?
+        .into_iter()
+        .map(|(broker, _)| broker)
+        .collect())
 }
 
 #[cfg(test)]

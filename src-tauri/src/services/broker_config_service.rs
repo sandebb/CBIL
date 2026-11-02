@@ -25,6 +25,7 @@ use crate::brokers::setup_guide::{self, KeyName};
 use crate::db::sqlite::credentials::{self, BrokerCredentialSet, CredentialUpdate};
 use crate::error::{AppError, Result};
 use crate::events::SessionEndReason;
+use crate::security::crypto::DEFAULT_ACCOUNT;
 use crate::security::{Secret, SecurityManager};
 use crate::services::broker_auth_service::BrokerAuthService;
 use crate::state::AppState;
@@ -155,9 +156,9 @@ impl BrokerConfigService {
         broker: &str,
         update: CredentialUpdate,
     ) -> Result<()> {
-        credentials::save(conn, security, broker, update)?;
-        crate::db::sqlite::auth::revoke(conn, broker)?;
-        crate::db::sqlite::auth::forget_account(conn, broker)?;
+        credentials::save(conn, security, broker, DEFAULT_ACCOUNT, update)?;
+        crate::db::sqlite::auth::revoke(conn, broker, DEFAULT_ACCOUNT)?;
+        crate::db::sqlite::auth::forget_account(conn, broker, DEFAULT_ACCOUNT)?;
         Ok(())
     }
 
@@ -167,7 +168,7 @@ impl BrokerConfigService {
     pub fn redirect_url(state: &AppState, broker: &str) -> Result<String> {
         let saved = {
             let conn = state.sqlite.conn()?;
-            credentials::redirect_url(&conn, broker)?
+            credentials::redirect_url(&conn, broker, DEFAULT_ACCOUNT)?
         };
         Ok(saved.unwrap_or_else(|| state.server_config().redirect_url_for(broker)))
     }
@@ -225,14 +226,15 @@ impl BrokerConfigService {
             // One row that cannot be decrypted (keys from another install)
             // must not hide every broker: it shows as saved but unreadable,
             // so the trader can enter its keys again or forget it.
-            let (saved, unreadable) = match credentials::load(&conn, &state.security, id) {
-                Ok(c) => (c, false),
-                Err(AppError::Locked) => return Err(AppError::Locked),
-                Err(e) => {
-                    tracing::warn!("Saved keys for {} cannot be read: {}", id, e);
-                    (None, true)
-                }
-            };
+            let (saved, unreadable) =
+                match credentials::load(&conn, &state.security, id, DEFAULT_ACCOUNT) {
+                    Ok(c) => (c, false),
+                    Err(AppError::Locked) => return Err(AppError::Locked),
+                    Err(e) => {
+                        tracing::warn!("Saved keys for {} cannot be read: {}", id, e);
+                        (None, true)
+                    }
+                };
             let configured = unreadable || saved.as_ref().is_some_and(|c| !c.api_key.is_empty());
             let guide = setup_guide::guide(id);
             let fields: Vec<Value> = guide
@@ -413,7 +415,7 @@ impl BrokerConfigService {
     ) -> Result<bool> {
         let mut conn = state.sqlite.conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let current = credentials::load(&tx, &state.security, broker)?;
+        let current = credentials::load(&tx, &state.security, broker, DEFAULT_ACCOUNT)?;
         let configured = current.as_ref().is_some_and(|c| !c.api_key.is_empty());
         if !configured {
             if let Some(f) = guide.fields.iter().find(|f| {
@@ -442,7 +444,7 @@ impl BrokerConfigService {
             .redirect_url
             .is_some_and(|u| u.ends_with(&format!("/{}/callback", broker)));
         if let Some(url) = redirect {
-            credentials::set_redirect_url(&tx, broker, url.as_deref())?;
+            credentials::set_redirect_url(&tx, broker, DEFAULT_ACCOUNT, url.as_deref())?;
             if global_named_broker {
                 crate::config::save(
                     &tx,

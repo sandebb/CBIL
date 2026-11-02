@@ -1475,6 +1475,7 @@ async fn a_broker_that_names_no_account_is_owned_by_its_saved_keys() {
             &t.h.ctx.sqlite.conn().unwrap(),
             &t.h.ctx.security,
             "zerodha",
+            openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT,
             CredentialUpdate {
                 api_key: Some(key.into()),
                 api_secret: Some("secret".into()),
@@ -1534,6 +1535,7 @@ fn save_keys(t: &Two, broker: &str, api_key: &str) {
         &t.h.ctx.sqlite.conn().unwrap(),
         &t.h.ctx.security,
         broker,
+        openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT,
         CredentialUpdate {
             api_key: Some(api_key.into()),
             api_secret: Some("secret".into()),

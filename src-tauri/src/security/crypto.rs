@@ -16,6 +16,11 @@ use rand::Rng;
 pub const NONCE_SIZE: usize = 12;
 pub const KEY_SIZE: usize = 32;
 
+/// The account label a single-account install had before multi-account
+/// (plan D3). Its rows keep the v1 binding, so ciphertexts written before
+/// multi-account stay valid without a fallback decrypt path.
+pub const DEFAULT_ACCOUNT: &str = "default";
+
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
 /// Associated data identifying where a ciphertext lives.
@@ -25,6 +30,22 @@ pub struct Aad(String);
 impl Aad {
     pub fn new(table: &str, column: &str, row: &str) -> Self {
         Aad(format!("openalgo:v1:{}:{}:{}", table, column, row))
+    }
+
+    /// Account-aware row binding for broker credential and session rows
+    /// (plan D3). The legacy default account keeps the v1 binding so
+    /// pre-multi-account ciphertexts still decrypt; any other account gets
+    /// its own v2 binding, which also stops a ciphertext copied from one
+    /// account being read back under another.
+    pub fn for_account(table: &str, column: &str, broker: &str, account: &str) -> Self {
+        if account == DEFAULT_ACCOUNT {
+            Self::new(table, column, broker)
+        } else {
+            Aad(format!(
+                "openalgo:v2:{}:{}:{}:{}",
+                table, column, broker, account
+            ))
+        }
     }
 
     /// Fixed associated data for non-row payloads such as the key vault.
@@ -181,6 +202,42 @@ mod tests {
         let aad = Aad::fixed("x");
         let (ct, n) = a.encrypt(b"v", &aad).unwrap();
         assert!(b.decrypt(&ct, &n, &aad).is_err());
+    }
+
+    #[test]
+    fn the_default_account_keeps_the_legacy_binding() {
+        assert_eq!(
+            Aad::for_account("auth", "auth_token", "zerodha", DEFAULT_ACCOUNT),
+            Aad::new("auth", "auth_token", "zerodha")
+        );
+        // And a v1 ciphertext still reads back under the default account.
+        let c = cipher();
+        let aad = Aad::new("broker_credentials", "api_key", "zerodha");
+        let (ct, n) = c.encrypt(b"key-1", &aad).unwrap();
+        assert_eq!(
+            c.decrypt(
+                &ct,
+                &n,
+                &Aad::for_account("broker_credentials", "api_key", "zerodha", DEFAULT_ACCOUNT)
+            )
+            .unwrap()
+            .expose(),
+            "key-1"
+        );
+    }
+
+    #[test]
+    fn a_named_account_gets_its_own_binding() {
+        let c = cipher();
+        let a = Aad::for_account("broker_credentials", "api_key", "fyers", "A");
+        let b = Aad::for_account("broker_credentials", "api_key", "fyers", "B");
+        let (ct, n) = c.encrypt(b"key-1", &a).unwrap();
+        assert_eq!(c.decrypt(&ct, &n, &a).unwrap().expose(), "key-1");
+        // A copy under another account, or under the legacy binding, fails.
+        assert!(c.decrypt(&ct, &n, &b).is_err());
+        assert!(c
+            .decrypt(&ct, &n, &Aad::new("broker_credentials", "api_key", "fyers"))
+            .is_err());
     }
 
     #[test]

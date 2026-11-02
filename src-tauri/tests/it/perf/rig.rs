@@ -441,6 +441,7 @@ impl Rig {
                 &conn,
                 &ctx.security,
                 "zerodha",
+                openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT,
                 CredentialUpdate {
                     api_key: Some(Secret::new("kitekey")),
                     api_secret: Some(Secret::new("kitesecret")),

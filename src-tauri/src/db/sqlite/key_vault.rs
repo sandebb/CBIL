@@ -368,24 +368,31 @@ pub fn witness(conn: &Connection) -> Result<Option<Witness>> {
             aad: super::api_keys::aad(&name),
         }));
     }
-    if let Some((broker, ct, n)) = first(
-        "SELECT broker_id, api_key_encrypted, api_key_nonce FROM broker_credentials
+    let first_row = |sql: &str| -> Result<Option<(String, String, String, String)>> {
+        Ok(conn
+            .query_row(sql, [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .optional()?)
+    };
+    if let Some((broker, account, ct, n)) = first_row(
+        "SELECT broker_id, account_id, api_key_encrypted, api_key_nonce FROM broker_credentials
          WHERE api_key_encrypted IS NOT NULL AND api_key_encrypted <> '' ORDER BY broker_id LIMIT 1",
     )? {
         return Ok(Some(Witness {
             ciphertext: ct,
             nonce: n,
-            aad: Aad::new("broker_credentials", "api_key", &broker),
+            aad: Aad::for_account("broker_credentials", "api_key", &broker, &account),
         }));
     }
-    if let Some((broker, ct, n)) = first(
-        "SELECT broker_id, auth_token_encrypted, auth_token_nonce FROM auth
+    if let Some((broker, account, ct, n)) = first_row(
+        "SELECT broker_id, account_id, auth_token_encrypted, auth_token_nonce FROM auth
          WHERE auth_token_encrypted <> '' AND auth_token_nonce IS NOT NULL ORDER BY id LIMIT 1",
     )? {
         return Ok(Some(Witness {
             ciphertext: ct,
             nonce: n,
-            aad: Aad::new("auth", "auth_token", &broker),
+            aad: Aad::for_account("auth", "auth_token", &broker, &account),
         }));
     }
     if let Some(w) = super::tunnel::witness(conn)? {

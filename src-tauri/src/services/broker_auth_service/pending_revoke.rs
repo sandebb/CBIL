@@ -32,7 +32,7 @@ impl PendingRevoke {
     pub(super) fn write(self, conn: &rusqlite::Connection) -> Result<()> {
         match self {
             Self::All => auth::revoke_all(conn).map(|_| ()),
-            Self::Before(boundary) => auth::revoke_before(conn, boundary, |broker| {
+            Self::Before(boundary) => auth::revoke_before(conn, boundary, |broker, _account| {
                 !catalog::has_daily_boundary(broker)
             })
             .map(|_| ()),

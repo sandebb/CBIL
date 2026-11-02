@@ -2731,6 +2731,7 @@ mod approvals {
             &conn,
             &t.h.ctx.security,
             "zerodha",
+            openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT,
             CredentialUpdate {
                 api_key: Some("kitekey".into()),
                 api_secret: Some("kitesecret".into()),

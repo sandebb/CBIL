@@ -47,6 +47,7 @@ fn every_broker() -> (TestCtx, Vec<Arc<MockBroker>>) {
             &conn,
             &t.ctx.security,
             b,
+            crate::security::crypto::DEFAULT_ACCOUNT,
             crate::db::sqlite::credentials::CredentialUpdate {
                 api_key: Some(if *b == "nubra" {
                     ACCOUNT.into()

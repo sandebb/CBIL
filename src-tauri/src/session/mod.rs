@@ -424,6 +424,7 @@ mod tests {
                 &conn,
                 &ctx.security,
                 "angel",
+                crate::security::crypto::DEFAULT_ACCOUNT,
                 crate::db::sqlite::credentials::CredentialUpdate {
                     api_key: Some("angelkey".into()),
                     ..Default::default()

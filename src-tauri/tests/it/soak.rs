@@ -528,6 +528,7 @@ async fn soak_session_cycles_hold_descriptors_rss_and_tasks_flat() {
             &conn,
             &ctx.security,
             "zerodha",
+            openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT,
             CredentialUpdate {
                 api_key: Some(Secret::new("kitekey")),
                 api_secret: Some(Secret::new("kitesecret")),
