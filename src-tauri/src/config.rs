@@ -37,6 +37,9 @@ pub struct ServerConfig {
     pub ngrok_allow: bool,
     pub websocket_url: Option<String>,
     pub active_broker: Option<String>,
+    /// The account of `active_broker` the default target trades through
+    /// (MULTI_BROKER_PLAN D3); `None` means the legacy single account.
+    pub default_account: Option<String>,
     pub redirect_url: Option<String>,
     /// Daily broker-session boundary in IST (web SESSION_EXPIRY_TIME).
     pub session_expiry_hour: u32,
@@ -54,6 +57,7 @@ impl Default for ServerConfig {
             ngrok_allow: false,
             websocket_url: None,
             active_broker: None,
+            default_account: None,
             redirect_url: None,
             session_expiry_hour: 3,
             session_expiry_minute: 0,
@@ -82,7 +86,7 @@ impl ServerConfig {
     pub fn load(conn: &Connection) -> Result<Self> {
         let mut c = conn.query_row(
             "SELECT http_port, ws_port, bind_host, host_server, ngrok_allow, websocket_url,
-                    active_broker, redirect_url, auto_logout_hour, auto_logout_minute
+                    active_broker, active_account, redirect_url, auto_logout_hour, auto_logout_minute
              FROM settings WHERE id = 1",
             [],
             |r| {
@@ -96,9 +100,12 @@ impl ServerConfig {
                     ngrok_allow: r.get::<_, i64>(4)? != 0,
                     websocket_url: r.get::<_, Option<String>>(5)?.filter(|s| !s.is_empty()),
                     active_broker: r.get::<_, Option<String>>(6)?.filter(|s| !s.is_empty()),
-                    redirect_url: r.get::<_, Option<String>>(7)?.filter(|s| !s.is_empty()),
-                    session_expiry_hour: r.get::<_, u32>(8)?,
-                    session_expiry_minute: r.get::<_, u32>(9)?,
+                    default_account: r
+                        .get::<_, Option<String>>(7)?
+                        .filter(|s| !s.is_empty()),
+                    redirect_url: r.get::<_, Option<String>>(8)?.filter(|s| !s.is_empty()),
+                    session_expiry_hour: r.get::<_, u32>(9)?,
+                    session_expiry_minute: r.get::<_, u32>(10)?,
                     dev_ports: false,
                 })
             },
@@ -201,6 +208,8 @@ pub struct ServerConfigUpdate {
     pub ngrok_allow: Option<bool>,
     pub websocket_url: Option<String>,
     pub active_broker: Option<String>,
+    /// `Some("")` goes back to the legacy single account.
+    pub default_account: Option<String>,
     pub redirect_url: Option<String>,
 }
 
@@ -224,7 +233,8 @@ pub fn save(conn: &Connection, u: &ServerConfigUpdate) -> Result<()> {
             ngrok_allow = COALESCE(?5, ngrok_allow),
             websocket_url = COALESCE(?6, websocket_url),
             active_broker = COALESCE(?7, active_broker),
-            redirect_url = COALESCE(?8, redirect_url),
+            active_account = COALESCE(?8, active_account),
+            redirect_url = COALESCE(?9, redirect_url),
             updated_at = datetime('now')
          WHERE id = 1",
         params![
@@ -235,6 +245,7 @@ pub fn save(conn: &Connection, u: &ServerConfigUpdate) -> Result<()> {
             u.ngrok_allow,
             u.websocket_url,
             u.active_broker,
+            u.default_account,
             u.redirect_url
         ],
     )?;
