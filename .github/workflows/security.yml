@@ -43,7 +43,7 @@ on:
       - .github/workflows/security.yml
       - scripts/ci/advisory_scan.sh
   push:
-    branches: [master]
+    branches: [main, master] # main: this fork's default branch (upstream uses master)
     paths:
       - package.json
       - package-lock.json

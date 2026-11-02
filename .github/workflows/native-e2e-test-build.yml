@@ -46,7 +46,7 @@ name: Native E2E (test build)
 
 on:
   push:
-    branches: [master]
+    branches: [main, master] # main: this fork's default branch (upstream uses master)
   pull_request:
     paths:
       - .github/workflows/native-e2e-test-build.yml
