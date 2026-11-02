@@ -336,7 +336,9 @@ class Gate(unittest.TestCase):
         for job in smoke_gate.NATIVE_ORDER_JOBS:
             self.assertIn(f"    name: {job}\n", test_build)
         self.assertEqual(test_build.count("\n    name: "), len(smoke_gate.NATIVE_ORDER_JOBS))
-        self.assertIn("  push:\n    branches: [master]\n", test_build)
+        # This fork's default branch is main (upstream's is master); the
+        # build must run on both, and a run by hand anywhere.
+        self.assertIn("  push:\n    branches: [main, master]", test_build)
         self.assertIn("  workflow_dispatch:\n", test_build)
 
 
