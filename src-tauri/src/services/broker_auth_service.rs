@@ -15,10 +15,13 @@
 //! * Every successful sign-in or resume starts the session's streaming
 //!   (`BrokerRuntime::activate`: master contract, feeds, order updates);
 //!   `revoke` tears it down.
-//! * After a password sign-in, `try_resume` brings back the stored session
-//!   if it was issued after the last 03:00 IST boundary (any time for a
-//!   crypto session, `catalog::has_daily_boundary`) and the broker
-//!   still accepts it (validated with a funds call, like the web).
+//! * After a password sign-in or a restart, `try_resume` brings back
+//!   every stored session that may still be resumed: one issued before
+//!   the last 03:00 IST boundary is revoked instead (any time for a
+//!   crypto session, `catalog::has_daily_boundary`); each broker still
+//!   accepts its token (a funds call, like the web), checked in parallel
+//!   with at most eight in flight; each accepted one joins the store
+//!   beside the live sessions, newest first (D-S3/D-S4).
 //! * Logout, a broker switch and account reset call `revoke` (every
 //!   session) or `revoke_broker` (one broker's), which end the session in
 //!   memory before it writes the stored row, and retry that write while it

@@ -644,6 +644,79 @@ mod tests {
         assert!(revoked(ctx, "zerodha"));
     }
 
+    /// D-S3, step 4: after a restart, every stored session that may still
+    /// be resumed comes back — each beside the other, each with its own
+    /// streaming — and the newest is the default target the shared feed
+    /// serves (D-S4); the checks for the two brokers ran, the rows stay.
+    #[tokio::test]
+    async fn two_stored_sessions_both_resume_after_a_restart() {
+        let (t, _) = harness(ist(5, 2, 0, 0));
+        let ctx = &t.ctx;
+        sign_in(ctx, "deltaexchange"); // crypto, 02:00
+        t.clock.set(ist(5, 2, 0, 30));
+        sign_in(ctx, "angel"); // equity, 02:00:30 — the newest
+                               // A restart: nothing live in memory; the stored rows stay.
+        ctx.set_broker_session(None);
+        let resumed = BrokerAuthService::try_resume(ctx).await.unwrap();
+        let d = crate::security::crypto::DEFAULT_ACCOUNT;
+        assert!(
+            ctx.broker_sessions.get("deltaexchange", d).is_some(),
+            "the crypto session did not resume"
+        );
+        assert!(
+            ctx.broker_sessions.get("angel", d).is_some(),
+            "the equity session did not resume"
+        );
+        // The newest is the default target; the other streams beside it.
+        assert_eq!(resumed.map(|s| s.broker_id).as_deref(), Some("angel"));
+        assert_eq!(active_broker(ctx).as_deref(), Some("angel"));
+        assert!(
+            ctx.broker_sessions
+                .runtime_for("deltaexchange", d)
+                .unwrap()
+                .active_broker()
+                .is_some(),
+            "the other's streaming did not start"
+        );
+        // Both stored rows stayed.
+        let c = ctx.sqlite.conn().unwrap();
+        let rows = crate::db::sqlite::auth::list_active(&c, &ctx.security).unwrap();
+        assert_eq!(rows.len(), 2, "a stored row was lost");
+        BrokerAuthService::revoke(ctx, SessionEndReason::Logout)
+            .await
+            .unwrap();
+    }
+
+    /// D-S3, step 4, the boundary's case: after a restart, the stored
+    /// equity session from before the daily boundary is revoked instead
+    /// (per row — never the newer session's), and the fresh one resumes.
+    #[tokio::test]
+    async fn the_stale_stored_one_is_revoked_and_the_fresh_one_survives() {
+        let (t, _) = harness(ist(5, 2, 0, 0));
+        let ctx = &t.ctx;
+        sign_in(ctx, "angel"); // equity, 02:00 — before the boundary
+        t.clock.set(ist(5, 4, 0, 0)); // past the 03:00 boundary
+        sign_in(ctx, "deltaexchange"); // crypto, 04:00 — fresh
+                                       // A restart: nothing live in memory.
+        ctx.set_broker_session(None);
+        let resumed = BrokerAuthService::try_resume(ctx).await.unwrap();
+        let d = crate::security::crypto::DEFAULT_ACCOUNT;
+        assert_eq!(
+            resumed.map(|s| s.broker_id).as_deref(),
+            Some("deltaexchange")
+        );
+        assert!(ctx.broker_sessions.get("deltaexchange", d).is_some());
+        assert!(
+            ctx.broker_sessions.get("angel", d).is_none(),
+            "the stale equity session came back"
+        );
+        assert!(revoked(ctx, "angel"), "the stale row is still active");
+        assert!(!revoked(ctx, "deltaexchange"));
+        BrokerAuthService::revoke(ctx, SessionEndReason::Logout)
+            .await
+            .unwrap();
+    }
+
     /// 14-N2: a continuous (crypto) session refreshes its master once when
     /// the UTC day turns, including across a clock jump; not again the same
     /// day, and never for an Indian broker. The refresh never interrupts

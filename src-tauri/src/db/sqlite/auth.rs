@@ -171,6 +171,19 @@ pub fn latest_active(
     Ok(list_active(conn, security)?.into_iter().next())
 }
 
+/// Whether one broker account's stored session is still active (not
+/// revoked, its token still there) — the per-row form of
+/// `latest_active`'s "this row survived meanwhile" check.
+pub fn is_active(conn: &Connection, broker_id: &str, account_id: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM auth WHERE broker_id = ?1 AND account_id = ?2
+            AND is_revoked = 0 AND auth_token_encrypted != ''",
+        params![broker_id, account_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 /// Revoke the stored session of one broker account.
 pub fn revoke(conn: &Connection, broker_id: &str, account_id: &str) -> Result<()> {
     conn.execute(
