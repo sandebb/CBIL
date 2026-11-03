@@ -179,9 +179,11 @@ fn store(
     Ok((previous, target))
 }
 
-/// One broker at a time: a save that makes another broker the active one
-/// ends the live session of the old one, and new keys for the logged-in
-/// broker end its session too (FLOW-04). Answers the broker signed out of.
+/// A save that ends the live session — one that makes another broker the
+/// active one, or new keys for the logged-in broker (FLOW-04: a session
+/// belongs to the keys it signed in with) — ends it after the save, under
+/// the session lock. Only that broker's session ends; another broker's
+/// stays live beside it (D-S3). Answers the broker signed out of.
 async fn end_replaced_session(
     state: &AppState,
     broker: Option<&str>,
@@ -194,8 +196,12 @@ async fn end_replaced_session(
         return None;
     }
     // The session ends in memory whatever the database does; a failed write
-    // of its stored row is retried by the session poll.
-    if let Err(e) = BrokerAuthService::revoke_held(state, SessionEndReason::Logout, held).await {
+    // of its stored row is retried by the session poll. Only this broker's
+    // session ends; the others stay live (D-S3).
+    if let Err(e) =
+        BrokerAuthService::revoke_broker_held(state, &s.broker_id, SessionEndReason::Logout, held)
+            .await
+    {
         tracing::error!(
             "Broker session ended by the settings save; its stored row is still to be revoked: {}",
             e

@@ -98,7 +98,7 @@ pub fn refresh_master_if_day_turned(ctx: &AppState, last_check: DateTime<Utc>) -
         "UTC day turned; refreshing the {} master contract",
         s.broker_id
     );
-    ctx.runtime.spawn_task(async move {
+    let refresh = async move {
         let Some(ctx) = weak.upgrade() else {
             return;
         };
@@ -109,7 +109,14 @@ pub fn refresh_master_if_day_turned(ctx: &AppState, last_check: DateTime<Utc>) -
                 e
             ),
         }
-    });
+    };
+    // The refresh runs as a task of the default session's streaming (D-S2),
+    // so it ends with that session; while no streaming runs (a session not
+    // activated yet) it runs on the context's own tasks.
+    match ctx.default_runtime() {
+        Some(runtime) => runtime.spawn_task(refresh),
+        None => ctx.spawn(refresh),
+    };
     true
 }
 
@@ -210,6 +217,32 @@ mod tests {
         s
     }
 
+    /// Activate the (broker, default account) entry's streaming (D-S2), as
+    /// a sign-in does.
+    async fn activate_entry(ctx: &AppState, broker: &str) {
+        let account = crate::security::crypto::DEFAULT_ACCOUNT;
+        let s = ctx.broker_sessions.get(broker, account).unwrap();
+        let rt = ctx.broker_sessions.runtime_for(broker, account).unwrap();
+        let ctx = ctx.arc().unwrap();
+        rt.activate(
+            &ctx,
+            &s,
+            ctx.is_default_session(&s.broker_id, &s.account_id),
+        )
+        .await;
+    }
+
+    /// Tear down the default entry's streaming, as a logout does.
+    async fn teardown_default(ctx: &AppState) {
+        let rt = ctx.default_runtime().unwrap();
+        rt.teardown(ctx, true).await;
+    }
+
+    /// The broker the default entry's streaming runs, if any.
+    fn active_broker(ctx: &AppState) -> Option<String> {
+        ctx.default_runtime().and_then(|rt| rt.active_broker())
+    }
+
     /// A signed-in browser session, signed in now.
     fn browser(ctx: &AppState) -> String {
         let s = ctx.sessions.create(ctx.now());
@@ -290,8 +323,8 @@ mod tests {
         let (t, b) = harness(ist(5, 2, 0, 0));
         let ctx = &t.ctx;
         let seen = ends(ctx);
-        let s = sign_in(ctx, "deltaexchange");
-        ctx.runtime.activate(ctx, &s).await;
+        sign_in(ctx, "deltaexchange");
+        activate_entry(ctx, "deltaexchange").await;
         let web = browser(ctx);
         for (last, now, fires) in [
             (ist(5, 2, 0, 0), ist(5, 2, 59, 0), false),
@@ -302,10 +335,7 @@ mod tests {
             assert_eq!(poll_tick(ctx, last).await, fires, "{}", now);
         }
         assert!(ctx.is_broker_connected());
-        assert_eq!(
-            ctx.runtime.active_broker().as_deref(),
-            Some("deltaexchange")
-        );
+        assert_eq!(active_broker(ctx).as_deref(), Some("deltaexchange"));
         assert_eq!(*b.delta.logouts.lock(), 0, "streaming was torn down");
         assert_eq!(stored(ctx).map(|s| s.0).as_deref(), Some("deltaexchange"));
         assert_eq!(received(ctx, &seen).await, vec![]);
@@ -317,7 +347,7 @@ mod tests {
         assert!(ctx.is_broker_connected());
         // A restart after the boundary resumes it, but only once the broker
         // accepts the stored key.
-        ctx.runtime.teardown(ctx).await;
+        teardown_default(ctx).await;
         ctx.set_broker_session(None);
         *b.delta.funds_ok.lock() = false;
         assert!(BrokerAuthService::try_resume(ctx).await.unwrap().is_none());
@@ -337,13 +367,13 @@ mod tests {
         let (t, _) = harness(ist(5, 2, 0, 0));
         let ctx = &t.ctx;
         let seen = ends(ctx);
-        let s = sign_in(ctx, "zerodha");
-        ctx.runtime.activate(ctx, &s).await;
+        sign_in(ctx, "zerodha");
+        activate_entry(ctx, "zerodha").await;
         let web = browser(ctx);
         t.clock.set(ist(5, 3, 1, 0));
         assert!(poll_tick(ctx, ist(5, 2, 59, 0)).await);
         assert!(!ctx.is_broker_connected());
-        assert_eq!(ctx.runtime.active_broker(), None);
+        assert_eq!(active_broker(ctx), None);
         assert!(ctx.sessions.get(&web, ctx.now()).is_none());
         assert_eq!(stored(ctx), None);
         assert_eq!(
@@ -363,11 +393,11 @@ mod tests {
         let ctx = &t.ctx;
         let seen = ends(ctx);
         let old_web = browser(ctx);
-        let old = sign_in(ctx, "zerodha");
-        ctx.runtime.activate(ctx, &old).await;
+        sign_in(ctx, "zerodha");
+        activate_entry(ctx, "zerodha").await;
         t.clock.set(ist(5, 3, 0, 5));
         let fresh = sign_in(ctx, "zerodha");
-        ctx.runtime.activate(ctx, &fresh).await;
+        activate_entry(ctx, "zerodha").await;
         let web = browser(ctx);
         t.clock.set(ist(5, 3, 0, 20));
         assert!(expire_if_crossed(ctx, ist(5, 2, 59, 50)).await);
@@ -376,7 +406,7 @@ mod tests {
             ctx.get_broker_session().map(|s| s.authenticated_at),
             Some(fresh.authenticated_at)
         );
-        assert_eq!(ctx.runtime.active_broker().as_deref(), Some("zerodha"));
+        assert_eq!(active_broker(ctx).as_deref(), Some("zerodha"));
         assert_eq!(
             stored(ctx),
             Some(("zerodha".to_string(), fresh.authenticated_at))
@@ -384,7 +414,7 @@ mod tests {
         assert!(ctx.sessions.get(&web, ctx.now()).is_some());
         assert!(ctx.sessions.get(&old_web, ctx.now()).is_none());
         assert_eq!(received(ctx, &seen).await, vec![]);
-        ctx.runtime.teardown(ctx).await;
+        teardown_default(ctx).await;
     }
 
     /// SES-02 when the poll is late because the computer slept: the clock
@@ -394,21 +424,21 @@ mod tests {
     async fn a_wake_from_sleep_keeps_the_sign_in_made_after_it() {
         let (t, _) = harness(ist(5, 2, 0, 0));
         let ctx = &t.ctx;
-        let s = sign_in(ctx, "zerodha");
-        ctx.runtime.activate(ctx, &s).await;
+        sign_in(ctx, "zerodha");
+        activate_entry(ctx, "zerodha").await;
         let last = ctx.now();
         t.clock.set(ist(6, 10, 0, 0));
         let fresh = sign_in(ctx, "zerodha");
-        ctx.runtime.activate(ctx, &fresh).await;
+        activate_entry(ctx, "zerodha").await;
         assert!(expire_if_crossed(ctx, last).await);
         assert!(ctx.is_broker_connected());
-        assert_eq!(ctx.runtime.active_broker().as_deref(), Some("zerodha"));
+        assert_eq!(active_broker(ctx).as_deref(), Some("zerodha"));
         assert_eq!(
             stored(ctx),
             Some(("zerodha".to_string(), fresh.authenticated_at))
         );
         assert!(!expire_if_crossed(ctx, ctx.now()).await);
-        ctx.runtime.teardown(ctx).await;
+        teardown_default(ctx).await;
     }
 
     /// SES-02, the race itself: a real sign-in that completes while the late
@@ -434,7 +464,7 @@ mod tests {
             .unwrap();
         }
         let old = sign_in(ctx, "angel");
-        ctx.runtime.activate(ctx, &old).await;
+        activate_entry(ctx, "angel").await;
         t.clock.set(ist(5, 3, 0, 5));
         let gate = Arc::new(tokio::sync::Barrier::new(2));
         *b.angel.auth_gate.lock() = Some(gate.clone());
@@ -458,12 +488,12 @@ mod tests {
             ctx.get_broker_session().map(|s| s.authenticated_at),
             Some(fresh.authenticated_at)
         );
-        assert_eq!(ctx.runtime.active_broker().as_deref(), Some("angel"));
+        assert_eq!(active_broker(ctx).as_deref(), Some("angel"));
         assert_eq!(
             stored(ctx),
             Some(("angel".to_string(), fresh.authenticated_at))
         );
-        ctx.runtime.teardown(ctx).await;
+        teardown_default(ctx).await;
     }
 
     /// The database refuses every change to a stored broker session.
@@ -573,7 +603,7 @@ mod tests {
         assert!(!BrokerAuthService::revoke_is_pending(ctx));
         assert!(revoked(ctx, "zerodha"));
         assert!(!revoked(ctx, "deltaexchange"));
-        ctx.runtime.teardown(ctx).await;
+        teardown_default(ctx).await;
     }
 
     /// SEC-05b with the boundary's scoped revoke: a logout whose revoke
@@ -627,8 +657,8 @@ mod tests {
         let (t, b) = harness(utc(5, 22));
         let ctx = &t.ctx;
         let seen = ends(ctx);
-        let s = sign_in(ctx, "deltaexchange");
-        ctx.runtime.activate(ctx, &s).await;
+        sign_in(ctx, "deltaexchange");
+        activate_entry(ctx, "deltaexchange").await;
         let downloads = || {
             b.delta
                 .calls
@@ -660,10 +690,7 @@ mod tests {
             .await
             .expect("the refresh started");
         assert!(ctx.is_broker_connected());
-        assert_eq!(
-            ctx.runtime.active_broker().as_deref(),
-            Some("deltaexchange")
-        );
+        assert_eq!(active_broker(ctx).as_deref(), Some("deltaexchange"));
         assert!(ctx.symbols.by_symbol("CRYPTO", "BTCUSDFUT").is_some());
         gate.release.notify_one();
         until("the new master", || {
@@ -673,10 +700,7 @@ mod tests {
         assert_eq!(downloads(), 2);
         assert!(ctx.symbols.by_symbol("CRYPTO", "BTCUSDFUT").is_some());
         assert!(ctx.is_broker_connected());
-        assert_eq!(
-            ctx.runtime.active_broker().as_deref(),
-            Some("deltaexchange")
-        );
+        assert_eq!(active_broker(ctx).as_deref(), Some("deltaexchange"));
         assert_eq!(*b.delta.logouts.lock(), 0, "streaming was torn down");
         // Not again the same day.
         *b.delta.master_gate.lock() = None;
@@ -688,23 +712,211 @@ mod tests {
         assert!(refresh_master_if_day_turned(ctx, utc(6, 23)));
         until("the failed refresh", || downloads() == 3).await;
         until("the failure to be recorded", || {
-            !ctx.runtime.claims.is_running("deltaexchange")
+            !ctx.claims.is_running("deltaexchange")
         })
         .await;
         assert!(ctx.symbols.by_symbol("CRYPTO", "ETHUSDFUT").is_some());
         assert!(ctx.is_broker_connected());
-        assert_eq!(
-            ctx.runtime.active_broker().as_deref(),
-            Some("deltaexchange")
-        );
+        assert_eq!(active_broker(ctx).as_deref(), Some("deltaexchange"));
         assert_eq!(*b.delta.logouts.lock(), 0, "streaming was torn down");
         assert_eq!(received(ctx, &seen).await, vec![]);
-        ctx.runtime.teardown(ctx).await;
+        teardown_default(ctx).await;
 
         let (t, _) = harness(utc(5, 22));
         let ctx = &t.ctx;
         sign_in(ctx, "zerodha");
         t.clock.set(utc(6, 4));
         assert!(!refresh_master_if_day_turned(ctx, utc(5, 22)));
+    }
+
+    // ------------------------------------ MULTI_BROKER_PLAN Phase 1, step 3
+    //
+    /// D-S3 (the Phase 1 acceptance test): two brokers are signed in at
+    /// once — each keeps its own session and streaming, both stored rows
+    /// are kept, and the newest is the default target the shared feed and
+    /// the settings serve. The later sign-in never ends the earlier one.
+    #[tokio::test]
+    async fn two_brokers_are_signed_in_at_once() {
+        let (t, b) = harness(ist(5, 10, 0, 0));
+        let ctx = &t.ctx;
+        let default = crate::security::crypto::DEFAULT_ACCOUNT;
+        sign_in(ctx, "zerodha");
+        activate_entry(ctx, "zerodha").await;
+        t.clock.set(ist(5, 10, 30, 0));
+        sign_in(ctx, "angel");
+        activate_entry(ctx, "angel").await;
+        // Both are live, each on its own streaming...
+        assert_eq!(ctx.broker_sessions.len(), 2, "both sessions are live");
+        assert_eq!(
+            ctx.runtime_for("zerodha", default)
+                .and_then(|rt| rt.active_broker()),
+            Some("zerodha".to_string()),
+            "the earlier one's streaming was not touched"
+        );
+        assert_eq!(
+            ctx.runtime_for("angel", default)
+                .and_then(|rt| rt.active_broker()),
+            Some("angel".to_string())
+        );
+        // ...and the newest is the default target, as are the settings.
+        assert_eq!(ctx.get_broker_session().unwrap().broker_id, "angel");
+        assert_eq!(active_broker(ctx).as_deref(), Some("angel"));
+        assert_eq!(ctx.server_config().active_broker.as_deref(), Some("angel"));
+        // Neither stored row was revoked by the other's sign-in.
+        assert!(!revoked(ctx, "zerodha"));
+        assert!(!revoked(ctx, "angel"));
+        assert_eq!(*b.angel.logouts.lock(), 0);
+        teardown_default(ctx).await;
+    }
+
+    /// D-S3: logging out one broker ends only it — the other's session,
+    /// its streaming, its stored row and its relay keep running. When the
+    /// one ending is the default, the newest survivor takes the shared
+    /// sockets (D-S4).
+    #[tokio::test]
+    async fn a_logout_of_one_broker_leaves_the_other_streaming() {
+        let (t, b) = harness(ist(5, 10, 0, 0));
+        let ctx = &t.ctx;
+        let default = crate::security::crypto::DEFAULT_ACCOUNT;
+        sign_in(ctx, "zerodha");
+        activate_entry(ctx, "zerodha").await;
+        t.clock.set(ist(5, 10, 30, 0));
+        sign_in(ctx, "angel");
+        activate_entry(ctx, "angel").await;
+        let zerodha_rt = ctx.runtime_for("zerodha", default).unwrap();
+        let angel_rt = ctx.runtime_for("angel", default).unwrap();
+        assert!(zerodha_rt.task_count() > 0);
+        let seen = ends(ctx);
+        // The newest is the default: ending it also ends the shared
+        // sockets, and the survivor is promoted to the default.
+        BrokerAuthService::revoke_broker(ctx, "angel", SessionEndReason::Logout)
+            .await
+            .unwrap();
+        assert!(
+            ctx.broker_sessions.get("angel", default).is_none(),
+            "angel's session is gone"
+        );
+        assert!(revoked(ctx, "angel"), "angel's stored row is revoked");
+        assert!(!revoked(ctx, "zerodha"), "zerodha's stored row is kept");
+        assert_eq!(*b.angel.logouts.lock(), 1);
+        // Zerodha's streaming keeps running, and it is the default now.
+        assert_eq!(
+            zerodha_rt.active_broker().as_deref(),
+            Some("zerodha"),
+            "the other broker's runtime keeps running"
+        );
+        assert!(zerodha_rt.task_count() > 0, "its tasks are still alive");
+        assert_eq!(
+            angel_rt.active_broker().as_deref(),
+            None,
+            "the ended one's runtime stopped"
+        );
+        assert_eq!(ctx.get_broker_session().unwrap().broker_id, "zerodha");
+        assert_eq!(active_broker(ctx).as_deref(), Some("zerodha"));
+        assert_eq!(received(ctx, &seen).await, vec![SessionEndReason::Logout]);
+        // And the reverse: ending the survivor ends it and only it.
+        BrokerAuthService::revoke_broker(ctx, "zerodha", SessionEndReason::Logout)
+            .await
+            .unwrap();
+        assert!(ctx.broker_sessions.is_empty());
+        assert!(zerodha_rt.active_broker().is_none());
+        assert!(revoked(ctx, "zerodha"));
+    }
+
+    /// D-S3 at the daily boundary: a session authenticated before the
+    /// boundary ends (memory, streaming, stored row); one authenticated
+    /// after it, and a crypto one, stay live beside the end, each on its
+    /// own streaming.
+    #[tokio::test]
+    async fn the_boundary_ends_only_the_stale_entries() {
+        let (t, b) = harness(ist(5, 2, 0, 0));
+        let ctx = &t.ctx;
+        let default = crate::security::crypto::DEFAULT_ACCOUNT;
+        sign_in(ctx, "zerodha"); // 02:00 IST: before the boundary
+        activate_entry(ctx, "zerodha").await;
+        sign_in(ctx, "deltaexchange"); // crypto: no boundary at all
+        activate_entry(ctx, "deltaexchange").await;
+        t.clock.set(ist(5, 3, 0, 5));
+        sign_in(ctx, "angel"); // after the boundary
+        activate_entry(ctx, "angel").await;
+        let angel_rt = ctx.runtime_for("angel", default).unwrap();
+        let delta_rt = ctx.runtime_for("deltaexchange", default).unwrap();
+        let seen = ends(ctx);
+        t.clock.set(ist(5, 3, 0, 20));
+        assert!(expire_if_crossed(ctx, ist(5, 2, 59, 50)).await);
+        // Zerodha, the stale one, is gone: memory, streaming, stored row.
+        assert!(
+            ctx.broker_sessions.get("zerodha", default).is_none(),
+            "the stale session is out of the store"
+        );
+        assert!(revoked(ctx, "zerodha"), "the stale row is revoked");
+        // Angel (fresh) and Delta (crypto) stay live, each streaming.
+        assert!(
+            ctx.broker_sessions.get("angel", default).is_some(),
+            "the fresh session stays"
+        );
+        assert!(
+            ctx.broker_sessions.get("deltaexchange", default).is_some(),
+            "the crypto session stays"
+        );
+        assert_eq!(angel_rt.active_broker().as_deref(), Some("angel"));
+        assert_eq!(delta_rt.active_broker().as_deref(), Some("deltaexchange"));
+        assert_eq!(*b.angel.logouts.lock(), 0);
+        assert_eq!(*b.delta.logouts.lock(), 0);
+        assert!(!revoked(ctx, "angel"));
+        assert!(!revoked(ctx, "deltaexchange"));
+        // The newest survivor is the default target.
+        assert_eq!(ctx.get_broker_session().unwrap().broker_id, "angel");
+        assert_eq!(
+            received(ctx, &seen).await,
+            vec![SessionEndReason::DailyExpiry]
+        );
+        // Angel is the default (the newest); its teardown owns the shared
+        // sockets, Delta's ends only its own.
+        angel_rt.teardown(ctx, true).await;
+        delta_rt.teardown(ctx, false).await;
+    }
+
+    /// D-S3 with SEC-05b: a logout of one broker whose stored row cannot
+    /// be revoked keeps the retry scoped to that broker — the sibling's
+    /// stored row is never reached, not even by the retry after a restart.
+    #[tokio::test]
+    async fn a_failed_logout_of_one_broker_never_reaches_the_siblings_row() {
+        let (t, _) = harness(ist(5, 10, 0, 0));
+        let ctx = &t.ctx;
+        sign_in(ctx, "zerodha");
+        sign_in(ctx, "angel");
+        fail_auth_writes(ctx);
+        assert!(
+            BrokerAuthService::revoke_broker(ctx, "angel", SessionEndReason::Logout)
+                .await
+                .is_err(),
+            "the row is still to be revoked"
+        );
+        assert!(BrokerAuthService::revoke_is_pending(ctx));
+        // A restart: only the marker on disk remembers the logout.
+        *ctx.revoke_pending.lock() = None;
+        assert!(
+            BrokerAuthService::revoke_is_pending(ctx),
+            "the marker scopes the retry to the logged-out broker"
+        );
+        allow_auth_writes(ctx);
+        poll_tick(ctx, ctx.now()).await;
+        assert!(!BrokerAuthService::revoke_is_pending(ctx));
+        assert!(revoked(ctx, "angel"), "the logged-out row is revoked");
+        assert!(
+            !revoked(ctx, "zerodha"),
+            "the sibling's stored row is untouched"
+        );
+        // The sibling can still be resumed: its row is intact.
+        let resumed = BrokerAuthService::try_resume(ctx).await.unwrap();
+        assert_eq!(
+            resumed.map(|s| s.broker_id).as_deref(),
+            Some("zerodha"),
+            "the sibling's session comes back"
+        );
+        if !ctx.broker_sessions.is_empty() {
+            teardown_default(ctx).await;
+        }
     }
 }

@@ -483,7 +483,11 @@ async fn transcripts_against_the_running_app() {
     *h.mock.feed_url.lock() = Some(broker_url);
     // Start the session again so its live feed connects to the socket.
     let session = h.ctx.get_broker_session().expect("the mock session");
-    h.ctx.runtime.activate(&h.ctx, &session).await;
+    h.ctx
+        .runtime_for(&session.broker_id, &session.account_id)
+        .unwrap()
+        .activate(&h.ctx, &session, true)
+        .await;
     assert!(
         eventually(Duration::from_secs(10), || h.ctx.websocket.is_connected()).await,
         "the session's market data feed connects"

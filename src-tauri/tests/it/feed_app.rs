@@ -448,7 +448,11 @@ async fn a_session_without_a_live_feed_says_so_for_each_item() {
     // Start the session's streaming, as a sign-in does. The mock broker has
     // no feed address, so it starts without a live feed.
     let session = h.ctx.get_broker_session().expect("the mock session");
-    h.ctx.runtime.activate(&h.ctx, &session).await;
+    h.ctx
+        .runtime_for(&session.broker_id, &session.account_id)
+        .unwrap()
+        .activate(&h.ctx, &session, true)
+        .await;
     assert!(
         crate::feed_support::eventually(Duration::from_secs(10), || h
             .ctx

@@ -872,7 +872,6 @@ async fn health_shows_market_depth_its_readers_skipped() {
     };
     assert_eq!(names(&v), ["market_data"], "{}", v);
     h.ctx
-        .runtime
         .depth_ws
         .stats()
         .note_skipped(openalgo_desktop_lib::websocket::Reader::FeedClients, 4);

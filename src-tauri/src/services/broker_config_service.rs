@@ -10,11 +10,13 @@
 //! left blank; [`forget`] removes one broker's keys, signing out of it
 //! when it is the one logged in.
 //!
-//! There is no "end the session" call for a switch: logging in to another
-//! broker ends the old session only when the new sign-in completes, on the
-//! server, under the session lock (`BrokerAuthService::authenticate_as`),
-//! so a sign-in that fails or is abandoned leaves the old one connected.
-//! The trader's own Logout and Forget are the only explicit ends.
+//! Several brokers are signed in at once (MULTI_BROKER_PLAN Phase 1):
+//! logging in to another broker ends no session — it joins the store
+//! beside the others, each on its own streaming (D-S2/D-S3), and the
+//! newest is the default target. The trader's own Logout and Forget (and
+//! a save that ends a session) are the explicit ends, each under the
+//! session lock (`BrokerAuthService::authenticate_as`, `revoke_broker`),
+//! so a sign-in that fails or is abandoned changes nothing.
 //!
 //! [`list`]: BrokerConfigService::list
 //! [`save`]: BrokerConfigService::save
@@ -352,8 +354,15 @@ impl BrokerConfigService {
         }
         let signed_out = live && keys_changed;
         if signed_out {
-            if let Err(e) =
-                BrokerAuthService::revoke_held(state, SessionEndReason::Logout, &held).await
+            // Only this broker's session ends (it belongs to the old keys);
+            // another broker's stays live (D-S3).
+            if let Err(e) = BrokerAuthService::revoke_broker_held(
+                state,
+                broker,
+                SessionEndReason::Logout,
+                &held,
+            )
+            .await
             {
                 // The session is over in memory; its row is retried.
                 tracing::error!("The ended broker session is still to be revoked: {}", e);
@@ -507,8 +516,15 @@ impl BrokerConfigService {
             tracing::warn!("Settings not reloaded after forgetting a broker: {}", e);
         }
         if live {
-            if let Err(e) =
-                BrokerAuthService::revoke_held(state, SessionEndReason::Logout, &held).await
+            // Only this broker's session ends; another broker's stays live
+            // (D-S3).
+            if let Err(e) = BrokerAuthService::revoke_broker_held(
+                state,
+                broker,
+                SessionEndReason::Logout,
+                &held,
+            )
+            .await
             {
                 // The session is over in memory; its row is gone already.
                 tracing::error!("The ended broker session is still to be revoked: {}", e);

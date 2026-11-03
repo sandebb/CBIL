@@ -118,9 +118,11 @@ fn broker_streams(ctx: &AppState) -> Vec<Component> {
         }];
     }
     let mut out = vec![stream("Broker market data", &ctx.websocket, true)];
-    let orders = &ctx.runtime.order_ws;
-    if orders.is_running() {
-        out.push(stream("Broker order updates", orders, false));
+    if let Some(runtime) = ctx.default_runtime() {
+        let orders = runtime.order_ws.as_ref();
+        if orders.is_running() {
+            out.push(stream("Broker order updates", orders, false));
+        }
     }
     out
 }

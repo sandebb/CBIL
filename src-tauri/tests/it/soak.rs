@@ -473,7 +473,10 @@ async fn cycle(r: &Rig, n: usize) {
     BrokerAuthService::revoke(ctx, SessionEndReason::Logout)
         .await
         .unwrap();
-    assert_eq!(ctx.runtime.task_count(), 0, "session tasks left running");
+    assert!(
+        ctx.default_runtime().is_none(),
+        "session tasks left running"
+    );
     assert!(!ctx.websocket.is_running());
     assert_eq!(ctx.websocket.instrument_count(), 0);
     assert!(ctx.bridge.applied().is_empty());

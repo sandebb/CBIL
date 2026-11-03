@@ -11,9 +11,16 @@ use crate::events::SessionEndReason;
 async fn connect_and_stream(h: &H) {
     h.connect_broker();
     let session = h.ctx().get_broker_session().expect("connected");
-    h.ctx().runtime.activate(h.ctx(), &session).await;
+    h.ctx()
+        .default_runtime()
+        .unwrap()
+        .activate(h.ctx(), &session, true)
+        .await;
     assert_eq!(
-        h.ctx().runtime.active_broker().as_deref(),
+        h.ctx()
+            .default_runtime()
+            .and_then(|rt| rt.active_broker())
+            .as_deref(),
         Some("zerodha"),
         "streaming started"
     );
@@ -237,7 +244,10 @@ async fn sec05_logout_ends_the_session_even_when_the_write_fails() {
 
     assert!(h.ctx().get_broker_session().is_none(), "session in memory");
     assert!(
-        h.ctx().runtime.active_broker().is_none(),
+        h.ctx()
+            .default_runtime()
+            .and_then(|rt| rt.active_broker())
+            .is_none(),
         "streaming stopped"
     );
     assert!(api_locked(&h, &key).await, "the API key still trades");
@@ -279,7 +289,10 @@ async fn sec05_daily_expiry_with_a_failed_write_stops_streaming() {
     h.t.clock.set(ist(2026, 10, 6, 3, 0));
     assert!(crate::session::expire_if_crossed(h.ctx(), before).await);
     assert!(
-        h.ctx().runtime.active_broker().is_none(),
+        h.ctx()
+            .default_runtime()
+            .and_then(|rt| rt.active_broker())
+            .is_none(),
         "streaming stopped"
     );
     assert!(h.ctx().get_broker_session().is_none());
@@ -313,7 +326,10 @@ async fn sec05_broker_switch_with_a_failed_write_ends_the_old_session() {
     assert_eq!(v["signed_out_of"], "zerodha");
     assert!(h.ctx().get_broker_session().is_none());
     assert!(
-        h.ctx().runtime.active_broker().is_none(),
+        h.ctx()
+            .default_runtime()
+            .and_then(|rt| rt.active_broker())
+            .is_none(),
         "streaming stopped"
     );
     assert!(api_key_refused(&h, &key).await);
@@ -338,7 +354,10 @@ async fn sec05_account_reset_always_stops_streaming() {
         .await
         .unwrap();
     assert!(
-        h.ctx().runtime.active_broker().is_none(),
+        h.ctx()
+            .default_runtime()
+            .and_then(|rt| rt.active_broker())
+            .is_none(),
         "streaming stopped"
     );
     assert!(!h.ctx().is_broker_connected());
@@ -367,7 +386,11 @@ async fn sec05_a_new_sign_in_finishes_the_pending_revoke_first() {
     crate::session::poll_tick(h.ctx(), h.ctx().now()).await;
     assert!(h.ctx().is_broker_connected());
     assert!(stored_session_active(&h), "the new session's row is kept");
-    h.ctx().runtime.teardown(h.ctx()).await;
+    h.ctx()
+        .default_runtime()
+        .unwrap()
+        .teardown(h.ctx(), true)
+        .await;
 }
 
 /// SEC-01: a signed-in browser's cookie rides on a GET from a link on
@@ -523,7 +546,11 @@ async fn sec05c_a_resume_racing_a_logout_installs_nothing() {
     let resumed = resume.await.unwrap().unwrap();
     assert!(resumed.is_none(), "a resume brought an ended session back");
     assert!(h.ctx().get_broker_session().is_none());
-    assert!(h.ctx().runtime.active_broker().is_none());
+    assert!(h
+        .ctx()
+        .default_runtime()
+        .and_then(|rt| rt.active_broker())
+        .is_none());
     assert!(!stored_session_active(&h));
 }
 
@@ -1086,7 +1113,13 @@ async fn flow03_a_failed_switch_save_keeps_the_live_session() {
         Some("zerodha"),
         "the live session was ended by a save that failed"
     );
-    assert_eq!(h.ctx().runtime.active_broker().as_deref(), Some("zerodha"));
+    assert_eq!(
+        h.ctx()
+            .default_runtime()
+            .and_then(|rt| rt.active_broker())
+            .as_deref(),
+        Some("zerodha")
+    );
     assert_eq!(
         h.ctx().server_config().active_broker.as_deref(),
         Some("zerodha")
@@ -1104,7 +1137,11 @@ async fn flow03_a_failed_switch_save_keeps_the_live_session() {
         "keys saved by a switch that failed"
     );
     drop(conn);
-    h.ctx().runtime.teardown(h.ctx()).await;
+    h.ctx()
+        .default_runtime()
+        .unwrap()
+        .teardown(h.ctx(), true)
+        .await;
 }
 
 /// FLOW-03: a new broker session and the active broker are stored together

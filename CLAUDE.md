@@ -79,12 +79,17 @@ a drop-in replacement for them.
     sign-in page is one card that goes to `/dashboard` when the broker
     session resumes and to `/broker` otherwise; each form broker logs in on
     a small card (`/broker/<broker>/totp`); the Profile Broker tab is a
-    summary. **One broker is logged in at a time**: logging in to another
-    asks first, and a completed sign-in always ends any other broker's
-    session (`BrokerAuthService::session_lock`). New keys for the logged-in
-    broker end its session too, after the same confirm (a session belongs
-    to the keys it signed in with); one account per broker is by design.
-    Every way a session ends for a switch is refused while Live
+    summary. **Several brokers are logged in at once** (MULTI_BROKER_PLAN
+    Phase 1): a completed sign-in never ends another broker's session —
+    each signed-in broker keeps its own streaming, and the newest session
+    is the default target the shared market feed and `/api/v1` serve
+    (D-S2/D-S4). An explicit logout ends only the named broker's session
+    (the app sign-out ends all); every hand-over runs under the session
+    lock (`BrokerAuthService::session_lock`). A sign-in whose keys
+    changed while it ran is refused (a session belongs to the keys it
+    signed in with); one account per broker is by design. The ways the
+    trader ends a session — new keys for that broker, forgetting it, the
+    settings save that switches the active one — are refused while Live
     automation, unsettled placements or filling exits depend on it
     (`services::broker_switch`, fed by the order-outcomes service).
     The keys each broker needs

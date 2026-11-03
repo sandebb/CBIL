@@ -480,13 +480,13 @@ pub struct DownloadClaim {
 impl Drop for DownloadClaim {
     fn drop(&mut self) {
         if let Some(c) = self.ctx.upgrade() {
-            c.runtime.claims.release(&self.broker);
+            c.claims.release(&self.broker);
         }
     }
 }
 
 fn try_claim(ctx: &Arc<AppState>, broker: &str) -> Option<DownloadClaim> {
-    ctx.runtime.claims.claim(broker).then(|| DownloadClaim {
+    ctx.claims.claim(broker).then(|| DownloadClaim {
         ctx: Arc::downgrade(ctx),
         broker: broker.to_string(),
     })
@@ -951,13 +951,27 @@ mod tests {
             }
             panic!("the session did not settle");
         }
+        async fn activate_entry(ctx: &Arc<AppState>, s: &crate::state::BrokerSession) {
+            let ctx = ctx.clone();
+            let s = s.clone();
+            let rt = ctx
+                .broker_sessions
+                .runtime_for(&s.broker_id, &s.account_id)
+                .unwrap();
+            rt.activate(
+                &ctx,
+                &s,
+                ctx.is_default_session(&s.broker_id, &s.account_id),
+            )
+            .await;
+        }
         ctx.set_broker_session(Some(session("zerodha")));
-        ctx.runtime.activate(ctx, &session("zerodha")).await;
+        activate_entry(ctx, &session("zerodha")).await;
         until(|| ctx.symbol_count() > 0).await;
         assert_eq!(ctx.symbol_count(), 1);
         *angel.master.lock() = Some(Err("down".into()));
         ctx.set_broker_session(Some(session("angel")));
-        ctx.runtime.activate(ctx, &session("angel")).await;
+        activate_entry(ctx, &session("angel")).await;
         until(|| alerts() == 1).await;
         assert_eq!(ctx.symbol_count(), 0, "zerodha's symbols stayed in memory");
         *angel.master.lock() = Some(Ok(vec![crate::brokers::common::symbols::tests::row(
@@ -966,7 +980,7 @@ mod tests {
         let ag: Arc<dyn Broker> = angel.clone();
         download(ctx, &ag, &AuthToken::new("t")).await.unwrap();
         assert_eq!(alerts(), 0);
-        ctx.runtime.teardown(ctx).await;
+        ctx.default_runtime().unwrap().teardown(ctx, true).await;
     }
 
     /// A fake broker market feed: accepts every connection and counts the
@@ -1034,10 +1048,14 @@ mod tests {
         // its own resync), and a feed client's SBIN streams. What the
         // broker saw by then, once settled, is the baseline.
         let s = start(ctx);
-        ctx.runtime.activate(ctx, &s).await;
+        let rt = ctx
+            .broker_sessions
+            .runtime_for(&s.broker_id, &s.account_id)
+            .unwrap();
+        rt.activate(ctx, &s, true).await;
         until("day one's master", || ctx.symbol_count() == 1).await;
         until("day one's order socket", || {
-            ctx.runtime.order_ws.is_connected()
+            ctx.default_runtime().unwrap().order_ws.is_connected()
         })
         .await;
         until("day one's market feed", || ctx.websocket.is_connected()).await;
@@ -1052,10 +1070,17 @@ mod tests {
         t.clock.set(ist(4, 9, 0));
         *zerodha.master.lock() = Some(Err("down".into()));
         let s = start(ctx);
-        ctx.runtime.activate(ctx, &s).await;
+        let rt = ctx
+            .broker_sessions
+            .runtime_for(&s.broker_id, &s.account_id)
+            .unwrap();
+        rt.activate(ctx, &s, true).await;
         // The order socket comes up after the point where the feed clients
         // would have been resynced.
-        until("the order socket", || ctx.runtime.order_ws.is_connected()).await;
+        until("the order socket", || {
+            ctx.default_runtime().unwrap().order_ws.is_connected()
+        })
+        .await;
         until("the market feed", || ctx.websocket.is_connected()).await;
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert_eq!(ctx.symbol_count(), 1, "day one's master was dropped");
@@ -1078,7 +1103,7 @@ mod tests {
         })
         .await;
         assert_eq!(ctx.bridge.applied().len(), 1);
-        ctx.runtime.teardown(ctx).await;
+        ctx.default_runtime().unwrap().teardown(ctx, true).await;
         server.abort();
         orders_server.abort();
     }
@@ -1249,7 +1274,7 @@ mod tests {
         assert!(claim_and_reset(ctx, "zerodha").is_none());
         assert_eq!(status().as_deref(), Some("success"));
         drop(held);
-        assert!(!ctx.runtime.claims.is_running("zerodha"));
+        assert!(!ctx.claims.is_running("zerodha"));
         assert!(claim_and_reset(ctx, "zerodha").is_some());
     }
 
@@ -1307,7 +1332,7 @@ mod tests {
         });
         assert_eq!(ensure(ctx, &zd, &AuthToken::new("t")).await.unwrap(), 1);
         assert_eq!(*refused.lock(), Some(true), "a download started mid-load");
-        assert!(!ctx.runtime.claims.is_running("zerodha"));
+        assert!(!ctx.claims.is_running("zerodha"));
         // An emptied stored copy is downloaded under the load's claim.
         {
             let mut c = ctx.sqlite.conn().unwrap();
@@ -1320,7 +1345,7 @@ mod tests {
             .calls
             .lock()
             .contains(&crate::brokers::mock::MockCall::MasterContract));
-        assert!(!ctx.runtime.claims.is_running("zerodha"));
+        assert!(!ctx.claims.is_running("zerodha"));
     }
 
     #[test]

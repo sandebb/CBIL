@@ -71,7 +71,13 @@ struct Timeline {
 /// the broker without telling the app; follow what happens.
 async fn drop_socket(rig: &Rig, book: &mut [Order], filled: Option<usize>) -> Timeline {
     let ctx = &rig.ctx;
-    let connects = ctx.runtime.order_ws.stats().connects.load(Ordering::SeqCst);
+    let connects = ctx
+        .default_runtime()
+        .unwrap()
+        .order_ws
+        .stats()
+        .connects
+        .load(Ordering::SeqCst);
     let gaps = ctx.reconciler.stats.gaps_closed.load(Ordering::SeqCst);
     let t0 = Instant::now();
     rig.orders.kick();
@@ -94,7 +100,7 @@ async fn drop_socket(rig: &Rig, book: &mut [Order], filled: Option<usize>) -> Ti
     let mut tick = tokio::time::interval(Duration::from_millis(1));
     while t0.elapsed() < GIVE_UP {
         tick.tick().await;
-        let ws = &ctx.runtime.order_ws;
+        let ws = ctx.default_runtime().unwrap().order_ws.clone();
         if t.connected.is_none()
             && ws.stats().connects.load(Ordering::SeqCst) > connects
             && ws.is_connected()

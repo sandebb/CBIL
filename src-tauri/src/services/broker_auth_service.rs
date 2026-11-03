@@ -19,16 +19,20 @@
 //!   if it was issued after the last 03:00 IST boundary (any time for a
 //!   crypto session, `catalog::has_daily_boundary`) and the broker
 //!   still accepts it (validated with a funds call, like the web).
-//! * Logout, a broker switch and account reset call `revoke`, which ends
-//!   the session in memory before it writes the stored row, and retries
-//!   that write while it fails. The daily boundary calls `expire_before`,
-//!   which ends only what was authenticated before it, and never a crypto
-//!   session.
-//! * One broker is logged in at a time: keys can be saved for many brokers,
-//!   but completing a sign-in ends any other broker's session first (the
-//!   full `revoke`), and every hand-over runs under one lock
-//!   (`session_lock`), so two sign-ins finishing together never leave two
-//!   sessions live.
+//! * Logout, a broker switch and account reset call `revoke` (every
+//!   session) or `revoke_broker` (one broker's), which end the session in
+//!   memory before it writes the stored row, and retry that write while it
+//!   fails — never over a session that is live meanwhile. The daily
+//!   boundary calls `expire_before`, which ends only the sessions
+//!   authenticated before it, and never a crypto session.
+//! * Several brokers are logged in at once (MULTI_BROKER_PLAN Phase 1):
+//!   keys are saved per broker, each signed-in (broker, account) keeps its
+//!   own streaming, and the newest session is the default target the
+//!   shared market feed and `/api/v1` serve (D-S2/D-S4). Signing in to one
+//!   broker never ends another's session; an explicit logout ends only the
+//!   named broker's (the app sign-out ends all). Every hand-over runs
+//!   under one lock (`session_lock`), so two sign-ins finishing together
+//!   never interleave.
 
 use crate::brokers::{catalog, BrokerCredentials};
 use crate::db::sqlite::{auth, credentials, oauth_state};
@@ -39,10 +43,10 @@ use crate::security::Secret;
 use crate::session::web::random_token;
 use crate::state::{AppState, BrokerSession};
 use std::collections::HashMap;
-use std::time::Duration;
 
 mod daily_boundary;
 mod pending_revoke;
+mod resume;
 
 pub use pending_revoke::PendingRevoke;
 
@@ -51,7 +55,6 @@ pub const OAUTH_STATE_TTL_MINUTES: i64 = 10;
 /// to be revoked, so a restart before the retry does not resume it
 /// (SEC-05b). It holds what is still to be revoked (`PendingRevoke`).
 pub const REVOKE_MARKER: &str = "broker-revoke.pending";
-const RESUME_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct BrokerAuthService;
 
@@ -556,30 +559,9 @@ impl BrokerAuthService {
                 name
             )));
         }
-        if let Some(live) = state
-            .get_broker_session()
-            .filter(|s| s.broker_id != broker_id)
-        {
-            // Live automation, unsettled placements or exits still filling
-            // on the old broker refuse the switch: nothing is stored and
-            // the old session stays (roadmap "Broker switching").
-            if let Some(why) = crate::services::broker_switch::refusal(state, &live.broker_id) {
-                tracing::info!(
-                    "Sign-in to {} refused: {} still has Live obligations",
-                    broker_id,
-                    live.broker_id
-                );
-                return Err(AppError::Validation(why));
-            }
-            tracing::info!(
-                "Ending the {} session: only one broker is logged in at a time",
-                live.broker_id
-            );
-            if let Err(e) = Self::revoke_held(state, SessionEndReason::Logout, &held).await {
-                // The session is over in memory; its row is retried.
-                tracing::error!("The ended broker session is still to be revoked: {}", e);
-            }
-        }
+        // A live session of another broker is not ended: several brokers
+        // are logged in at once (MULTI_BROKER_PLAN), and this sign-in is
+        // the newest — the default target they trade through.
         Self::persist(state, &session)?;
         Self::activate(state, &session).await;
         drop(held);
@@ -618,10 +600,20 @@ impl BrokerAuthService {
     }
 
     /// Start the session's streaming (master contract, feeds, order
-    /// updates).
+    /// updates) on the entry's own runtime (D-S2); the newest session is
+    /// the default target the shared market feed and the bridge serve.
     async fn activate(state: &AppState, session: &BrokerSession) {
         match state.arc() {
-            Some(ctx) => ctx.runtime.activate(&ctx, session).await,
+            Some(ctx) => {
+                let is_default = state.is_default_session(&session.broker_id, &session.account_id);
+                match state.runtime_for(&session.broker_id, &session.account_id) {
+                    Some(runtime) => runtime.activate(&ctx, session, is_default).await,
+                    None => tracing::error!(
+                        "Broker streaming could not start: no session entry for {}",
+                        session.broker_id
+                    ),
+                }
+            }
             None => tracing::error!("Broker streaming could not start: the app is shutting down"),
         }
     }
@@ -635,10 +627,19 @@ impl BrokerAuthService {
             // change together or not at all.
             let mut pending = state.revoke_pending.lock();
             let was_pending = Self::pending_locked(state, &pending);
+            // The new session is live from this commit on: the pending
+            // revoke (and any later retry) must not reach its row.
+            let mut live: Vec<(String, String)> = state
+                .broker_sessions
+                .list()
+                .into_iter()
+                .map(|s| (s.broker_id, s.account_id))
+                .collect();
+            live.push((s.broker_id.clone(), s.account_id.clone()));
             let mut conn = state.sqlite.conn()?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             if let Some(what) = was_pending {
-                what.write(&tx)?;
+                what.write(&tx, &live)?;
             }
             auth::upsert(
                 &tx,
@@ -666,7 +667,9 @@ impl BrokerAuthService {
             Self::clear_pending_locked(state, &mut pending);
         }
         let _ = state.reload_config();
-        state.set_broker_session(Some(s.clone()));
+        // A second broker's session stays live beside it (D-S3); this one
+        // is the newest, so it is the default target (D-S4).
+        state.broker_sessions.upsert(s.clone());
         state.api_keys.clear();
         state.bus.publish(Event::BrokerConnected {
             broker: s.broker_id.clone(),
@@ -676,181 +679,123 @@ impl BrokerAuthService {
         Ok(())
     }
 
-    /// Resume the stored session after a password sign-in. `Ok(None)` when
-    /// there is nothing to resume or the broker no longer accepts it.
-    pub async fn try_resume(state: &AppState) -> Result<Option<BrokerSession>> {
-        if let Some(s) = state.get_broker_session() {
-            return Ok(Some(s));
-        }
-        // A session the trader ended whose row could not be revoked yet is
-        // never brought back: the pending revoke is written first, and
-        // while it cannot be, nothing is resumed. Once written, only what
-        // it spared can come back (a crypto session the boundary kept).
-        if Self::revoke_is_pending(state) {
-            if let Err(e) = Self::retry_pending_revoke(state) {
-                tracing::warn!("The ended broker session is still to be revoked: {}", e);
-                return Ok(None);
-            }
-        }
-        let Some(stored) = Self::resumable_stored_session(state)? else {
-            return Ok(None);
-        };
-        if !Self::broker_accepts(state, &stored).await? {
-            return Ok(None);
-        }
-        Self::install_resumed(state, stored).await
-    }
-
-    /// The latest stored session, if it may still be resumed. One from
-    /// before the daily boundary is revoked instead; a continuous (crypto)
-    /// session has no daily boundary (SES-01), and the broker checks its
-    /// token either way.
-    fn resumable_stored_session(state: &AppState) -> Result<Option<auth::StoredBrokerSession>> {
-        let stored = {
-            let conn = state.sqlite.conn()?;
-            match auth::latest_active(&conn, &state.security) {
-                Ok(s) => s,
-                Err(AppError::Locked) => None,
-                Err(e) => return Err(e),
-            }
-        };
-        let Some(stored) = stored else {
-            return Ok(None);
-        };
-        let cfg = state.server_config();
-        if catalog::has_daily_boundary(&stored.broker_id)
-            && !crate::session::boundary::is_fresh(
-                stored.authenticated_at,
-                state.now(),
-                cfg.session_expiry_hour,
-                cfg.session_expiry_minute,
-            )
-        {
-            let conn = state.sqlite.conn()?;
-            auth::revoke(&conn, &stored.broker_id, &stored.account_id)?;
-            return Ok(None);
-        }
-        Ok(Some(stored))
-    }
-
-    /// Whether the broker still accepts the stored token. Like the web, a
-    /// cheap funds call proves it; per-login state the token does not carry
-    /// (Kotak's UCC) comes back from the stored broker credentials first.
-    async fn broker_accepts(state: &AppState, stored: &auth::StoredBrokerSession) -> Result<bool> {
-        let Some(broker) = state.brokers.get(&stored.broker_id) else {
-            return Ok(false);
-        };
-        let stored_creds = {
-            let conn = state.sqlite.conn()?;
-            credentials::load(
-                &conn,
-                &state.security,
-                &stored.broker_id,
-                &stored.account_id,
-            )?
-        };
-        if let Some(c) = &stored_creds {
-            broker.restore_session(&Self::stored_input(c));
-        }
-        match tokio::time::timeout(
-            RESUME_CHECK_TIMEOUT,
-            broker.get_funds(&crate::brokers::types::AuthToken::new(
-                stored.auth_token.expose(),
-            )),
-        )
-        .await
-        {
-            Ok(Ok(_)) => Ok(true),
-            Ok(Err(e)) => {
-                tracing::info!("Stored broker session not accepted by broker: {}", e.code());
-                Ok(false)
-            }
-            Err(_) => {
-                tracing::info!("Broker did not answer the session check in time");
-                Ok(false)
-            }
-        }
-    }
-
-    /// Install the resumed session. A sign-in or a sign-out may have
-    /// finished during the broker's check: under the session lock, the
-    /// stored session comes back only if nothing changed meanwhile.
-    async fn install_resumed(
-        state: &AppState,
-        stored: auth::StoredBrokerSession,
-    ) -> Result<Option<BrokerSession>> {
-        let session = BrokerSession {
-            broker_id: stored.broker_id.clone(),
-            account_id: stored.account_id.clone(),
-            auth_token: stored.auth_token,
-            feed_token: stored.feed_token,
-            user_id: stored.user_id.unwrap_or_default(),
-            user_name: stored.user_name,
-            authenticated_at: stored.authenticated_at,
-        };
-        let _held = Self::session_lock(state).await;
-        if let Some(s) = state.get_broker_session() {
-            return Ok(Some(s));
-        }
-        if Self::revoke_is_pending(state) {
-            return Ok(None);
-        }
-        let still_stored = {
-            let conn = state.sqlite.conn()?;
-            auth::latest_active(&conn, &state.security)?.is_some_and(|s| {
-                s.broker_id == session.broker_id && s.authenticated_at == session.authenticated_at
-            })
-        };
-        if !still_stored {
-            return Ok(None);
-        }
-        state.set_broker_session(Some(session.clone()));
-        state.bus.publish(Event::BrokerConnected {
-            broker: session.broker_id.clone(),
-            user_id: Some(session.user_id.clone()),
-        });
-        tracing::info!("Resumed broker session for {}", session.broker_id);
-        Self::activate(state, &session).await;
-        Ok(Some(session))
-    }
-
-    /// End the broker session everywhere. Memory goes first and the stored
-    /// row last, as on the web (which drops its cache before the database
-    /// write): the in-memory session, the API-key cache, streaming (feeds
-    /// closed, subscriptions cleared, owned tasks aborted, adapter pollers
-    /// stopped) and the symbol cache, then subscribers are told, then the
-    /// row is revoked.
+    /// End every broker session (the app sign-out, a fresh start, an
+    /// account reset). Memory goes first and the stored rows last, as on
+    /// the web (which drops its cache before the database write): each
+    /// entry's streaming (feeds closed, subscriptions cleared, owned tasks
+    /// aborted, adapter pollers stopped), the API-key cache and the symbol
+    /// cache, then subscribers are told, then the rows are revoked.
     ///
-    /// The session is over in this process whatever the database does. If
-    /// the row cannot be written, the revoke stays pending, in memory and in
-    /// a marker file in the data folder that the next start reads
+    /// The sessions are over in this process whatever the database does. If
+    /// the rows cannot be written, the revoke stays pending, in memory and
+    /// in a marker file in the data folder that the next start reads
     /// (`REVOKE_MARKER`, SEC-05b): no stored session is resumed until the
     /// session poll, a resume or the next sign-in writes it
-    /// (`retry_pending_revoke`), in this run or the next. An `Err` means
-    /// only that the stored row is still to be revoked.
+    /// (`retry_pending_revoke`), in this run or the next — and a write
+    /// never reaches a row whose session is live meanwhile. An `Err` means
+    /// only that a stored row is still to be revoked.
     pub async fn revoke(state: &AppState, reason: SessionEndReason) -> Result<()> {
         let held = Self::session_lock(state).await;
-        Self::revoke_held(state, reason, &held).await
+        Self::revoke_all_held(state, reason, &held).await
+    }
+
+    /// End one broker's session (its default account, Phase 1) while the
+    /// others stay live (D-S3). The newest entry's teardown owns the shared
+    /// sockets; when that is the one ending, the newest survivor is
+    /// promoted to the default (D-S4).
+    pub async fn revoke_broker(
+        state: &AppState,
+        broker: &str,
+        reason: SessionEndReason,
+    ) -> Result<()> {
+        let held = Self::session_lock(state).await;
+        Self::revoke_broker_held(state, broker, reason, &held).await
     }
 
     /// `revoke` for a caller that already holds the session lock
     /// (`session_lock`); the guard is the proof.
-    pub async fn revoke_held(
+    pub async fn revoke_all_held(
         state: &AppState,
         reason: SessionEndReason,
         _held: &tokio::sync::MutexGuard<'_, ()>,
     ) -> Result<()> {
         // Marked before memory is cleared, so a sign-in racing this call
-        // cannot resume the row being revoked, and recorded on disk, so a
-        // stop or a restart before the row is written cannot bring it back.
+        // cannot resume a row being revoked, and recorded on disk, so a
+        // stop or a restart before the rows are written cannot bring them
+        // back.
         {
             let mut pending = state.revoke_pending.lock();
             Self::mark_pending_locked(state, &mut pending, PendingRevoke::All);
         }
-        state.set_broker_session(None);
+        // Every live entry ends; the newest's teardown also owns the shared
+        // market and depth sockets (D-S2).
+        let entries = state.broker_sessions.entries();
+        let newest = entries
+            .iter()
+            .max_by(|a, b| a.session.authenticated_at.cmp(&b.session.authenticated_at));
+        for e in &entries {
+            let is_default = newest.is_some_and(|n| {
+                n.session.broker_id == e.session.broker_id
+                    && n.session.account_id == e.session.account_id
+            });
+            if state
+                .broker_sessions
+                .take_entry(&e.session.broker_id, &e.session.account_id)
+                .is_some()
+            {
+                e.runtime.teardown(state, is_default).await;
+            }
+        }
         state.api_keys.clear();
-        state.runtime.teardown(state).await;
         state.clear_symbol_cache();
+        state.bus.publish(Event::BrokerSessionEnded { reason });
+        let written = Self::retry_pending_revoke(state);
+        // No copy of the ended sessions may outlive them in the data
+        // folder's update backups (REL-02 security review).
+        crate::db::upgrade::purge_backups(&state.data_dir, "Broker session ended");
+        written
+    }
+
+    /// `revoke_broker` for a caller that already holds the session lock.
+    pub async fn revoke_broker_held(
+        state: &AppState,
+        broker: &str,
+        reason: SessionEndReason,
+        _held: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<()> {
+        // Marked before memory is cleared, so a sign-in racing this call
+        // cannot resume the row being revoked, and recorded on disk, scoped
+        // to this broker: a failed write must never grow into a sibling's
+        // stored session (SEC-05b, D-S3).
+        {
+            let mut pending = state.revoke_pending.lock();
+            Self::mark_pending_locked(
+                state,
+                &mut pending,
+                PendingRevoke::Pair(
+                    broker.to_string(),
+                    crate::security::crypto::DEFAULT_ACCOUNT.to_string(),
+                ),
+            );
+        }
+        // Phase 1: a session signs in with the default account's keys (D3);
+        // the accounts UI names others.
+        let account = crate::security::crypto::DEFAULT_ACCOUNT;
+        let was_default = state.broker_sessions.is_newest(broker, account);
+        if let Some(entry) = state.broker_sessions.take_entry(broker, account) {
+            entry.runtime.teardown(state, was_default).await;
+        }
+        // The default socket had this session's feed: the newest survivor
+        // takes it (D-S4), or nothing does.
+        if was_default && !state.broker_sessions.is_empty() {
+            if let Some(ctx) = state.arc() {
+                crate::services::broker_runtime::promote_default(&ctx).await;
+            }
+        }
+        state.api_keys.clear();
+        if state.broker_sessions.is_empty() {
+            state.clear_symbol_cache();
+        }
         state.bus.publish(Event::BrokerSessionEnded { reason });
         let written = Self::retry_pending_revoke(state);
         // No copy of the ended session may outlive it in the data folder's
@@ -869,13 +814,20 @@ impl BrokerAuthService {
     /// Write a pending revoke; a no-op when none is pending. Run by
     /// `revoke` itself, by the session poll every 30 seconds (which also
     /// finishes a revoke a previous run left pending) and before a resume.
+    /// A session that is live meanwhile is never revoked by it.
     pub fn retry_pending_revoke(state: &AppState) -> Result<()> {
         let mut pending = state.revoke_pending.lock();
         let Some(what) = Self::pending_locked(state, &pending) else {
             return Ok(());
         };
+        let live: Vec<(String, String)> = state
+            .broker_sessions
+            .list()
+            .into_iter()
+            .map(|s| (s.broker_id, s.account_id))
+            .collect();
         let conn = state.sqlite.conn()?;
-        what.write(&conn)?;
+        what.write(&conn, &live)?;
         Self::clear_pending_locked(state, &mut pending);
         Ok(())
     }
@@ -900,7 +852,7 @@ impl BrokerAuthService {
             // Present but unreadable: fail closed.
             Err(_) => Some(PendingRevoke::All),
         };
-        match (*pending, on_disk) {
+        match (pending.clone(), on_disk) {
             (Some(a), Some(b)) => Some(a.merge(b)),
             (a, b) => a.or(b),
         }
@@ -911,8 +863,11 @@ impl BrokerAuthService {
         pending: &mut Option<PendingRevoke>,
         what: PendingRevoke,
     ) {
-        let what = Self::pending_locked(state, pending).map_or(what, |p| p.merge(what));
-        *pending = Some(what);
+        let what = match Self::pending_locked(state, pending) {
+            Some(p) => p.merge(what),
+            None => what,
+        };
+        *pending = Some(what.clone());
         let marker = Self::revoke_marker(state);
         if let Err(e) =
             crate::security::fsperm::write_private_file(&marker, what.encode().as_bytes())

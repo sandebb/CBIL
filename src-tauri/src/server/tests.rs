@@ -2049,7 +2049,7 @@ async fn state_less_callbacks_are_bound_to_the_browser_session() {
     assert!(location(&headers).starts_with("/broker?error="));
     // A broker that always echoes state (zerodha-like) never falls back.
     assert!(crate::brokers::catalog::callback_carries_state("upstox"));
-    ctx.runtime.teardown(ctx).await;
+    ctx.default_runtime().unwrap().teardown(ctx, true).await;
 }
 
 /// Arrow (and the HDFC pair) may drop `state`, and their API key does not
@@ -2141,7 +2141,7 @@ async fn first_state_less_sign_in_needs_the_saved_client_id() {
     .await;
     assert_eq!(location(&h), "/dashboard");
     assert_eq!(ctx.get_broker_session().unwrap().user_id, "AR123");
-    ctx.runtime.teardown(ctx).await;
+    ctx.default_runtime().unwrap().teardown(ctx, true).await;
 }
 
 /// The `state` OpenAlgo put on an authorize address (on the query, or
@@ -2486,7 +2486,7 @@ async fn every_way_to_create_a_broker_session_refuses_a_forged_attempt() {
         );
         assert_eq!(stored.user_id.as_deref(), Some("U1"), "{}", name);
         drop(conn);
-        ctx.runtime.teardown(ctx).await;
+        ctx.default_runtime().unwrap().teardown(ctx, true).await;
     }
 }
 
@@ -2604,13 +2604,22 @@ async fn forged_state_less_callbacks_are_refused() {
     assert!(location(&h).starts_with("/broker?error="));
     assert_eq!(ctx.get_broker_session().unwrap().broker_id, "shoonya");
     *dhan.auth_user_id.lock() = "U1".into();
+    // After the shoonya session's moment, so dhan is the newest and the
+    // default target (D-S4); the shoonya one stays live beside it.
+    t.clock.advance(chrono::Duration::seconds(1));
     BrokerAuthService::start_oauth(ctx, "dhan", Some(&sid))
         .await
         .unwrap();
     let (_, h, _) = send_to(ctx, dhan_cb("tokenId=t1&consentAppId=consent-1")).await;
     assert_eq!(location(&h), "/dashboard");
     assert_eq!(ctx.get_broker_session().unwrap().broker_id, "dhan");
-    ctx.runtime.teardown(ctx).await;
+    assert!(
+        ctx.broker_sessions
+            .get("shoonya", crate::security::crypto::DEFAULT_ACCOUNT)
+            .is_some(),
+        "shoonya's session stays live beside dhan's"
+    );
+    ctx.default_runtime().unwrap().teardown(ctx, true).await;
 }
 
 #[tokio::test]
@@ -2668,7 +2677,7 @@ async fn xts_form_post_redirect_is_public_and_state_verified() {
     // No session, no CSRF token: refused before the form is read.
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert!(mocks[4].last_auth.lock().is_none());
-    ctx.runtime.teardown(ctx).await;
+    ctx.default_runtime().unwrap().teardown(ctx, true).await;
 }
 
 #[tokio::test]
@@ -2730,7 +2739,7 @@ async fn login_forms_follow_the_brokers_own_fields() {
             .as_deref(),
         Some("pasted-token")
     );
-    ctx.runtime.teardown(ctx).await;
+    ctx.default_runtime().unwrap().teardown(ctx, true).await;
 }
 
 #[tokio::test]
@@ -2764,7 +2773,7 @@ async fn pasted_token_addresses_need_the_signed_in_trader() {
     assert_eq!(a.password.as_deref(), Some("tok"));
     assert_eq!(a.client_id.as_deref(), Some("U1"));
     assert!(a.request_token.is_none());
-    ctx.runtime.teardown(ctx).await;
+    ctx.default_runtime().unwrap().teardown(ctx, true).await;
 }
 
 /// MC-01 and MC-03: a cache reload refuses another broker's stored master
@@ -2851,7 +2860,11 @@ async fn cache_reload_and_skip_check_the_stored_master() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert_eq!(h.ctx().symbol_count(), 1);
-    h.ctx().runtime.teardown(h.ctx()).await;
+    h.ctx()
+        .default_runtime()
+        .unwrap()
+        .teardown(h.ctx(), true)
+        .await;
 }
 
 /// MC-04 through the API: Delta's fractional spot minimum (0.0001 BTC) is
@@ -3010,7 +3023,7 @@ async fn master_contract_routes_and_server_settings_status() {
 
     // Web #2117: a forced download while one runs is refused with the web's
     // sentence, and the running download's status row is left alone.
-    assert!(h.ctx().runtime.claims.claim("zerodha"));
+    assert!(h.ctx().claims.claim("zerodha"));
     let (s, v) = h
         .json(with_session(
             post_json("/api/master-contract/download", json!({"force": true})),
@@ -3032,7 +3045,7 @@ async fn master_contract_routes_and_server_settings_status() {
         ))
         .await;
     assert_eq!(v["status"], "success");
-    h.ctx().runtime.claims.release("zerodha");
+    h.ctx().claims.release("zerodha");
 
     // The feed listener's state reaches Server Settings with its fix.
     *h.ctx().feed_status.write() = crate::state::ServerStatus::PortInUse {
@@ -3051,5 +3064,9 @@ async fn master_contract_routes_and_server_settings_status() {
     let sv = serde_json::to_value(&st).unwrap();
     assert_eq!(sv["ws"]["state"], "port_in_use");
     assert!(sv.get("state").is_some());
-    h.ctx().runtime.teardown(h.ctx()).await;
+    h.ctx()
+        .default_runtime()
+        .unwrap()
+        .teardown(h.ctx(), true)
+        .await;
 }

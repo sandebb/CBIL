@@ -18,6 +18,8 @@ use crate::security::keystore::KeyStore;
 use crate::security::{Secret, SecurityManager};
 use crate::server::ratelimit::RateLimiter;
 use crate::services::apikey_service::ApiKeyCache;
+use crate::services::broker_runtime::BrokerRuntime;
+use crate::services::master_contract_service::DownloadClaims;
 use crate::session::web::WebSessionStore;
 use crate::websocket::WebSocketManager;
 use chrono::{DateTime, Utc};
@@ -45,23 +47,33 @@ pub struct BrokerSession {
     pub authenticated_at: DateTime<Utc>,
 }
 
-/// One live broker session and the symbol-master handle loaded for it.
-/// In Phase 1 the handle is an alias of the app's default master object
-/// (D-S2, `MULTI_BROKER_PHASE1_RUNTIME_DESIGN.md`): one session at a time,
-/// and its master is the app's master, so the modules that hold clones of
-/// the object (strategy, scalping, sandbox, bridge, agent) see the same
-/// rows the session loads. The multi-session core installs non-default
-/// entries with their own handle (step 3).
-#[derive(Debug, Clone)]
+/// One live broker session, the symbol-master handle it loads through, and
+/// the streaming that runs for it (D-S2, `MULTI_BROKER_PHASE1_RUNTIME_DESIGN.md`).
+/// The master handle is an alias of the app's default master object in Phase 1,
+/// so the modules that hold clones of it (strategy, scalping, sandbox, bridge,
+/// agent) see the same rows the session loads; the entry's `runtime` is its own
+/// instance: its order feed, its owned tasks and its order relay, which keep
+/// running while another entry holds the shared market feed (the default rule).
+#[derive(Clone)]
 pub struct SessionEntry {
     pub session: BrokerSession,
     pub symbols: SymbolResolver,
+    pub runtime: Arc<BrokerRuntime>,
 }
 
-/// The live broker sessions, keyed by (broker, account). Today one at a
-/// time; the multi-session core grows it to several (MULTI_BROKER_PLAN
-/// Phase 1) without touching the 77 `get_broker_session` call sites, which
-/// keep resolving the default target (the newest session).
+impl std::fmt::Debug for SessionEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionEntry")
+            .field("session", &self.session)
+            .field("symbols", &self.symbols)
+            .field("runtime", &"BrokerRuntime")
+            .finish()
+    }
+}
+
+/// The live broker sessions, keyed by (broker, account). Several at once
+/// (MULTI_BROKER_PLAN Phase 1): the `get_broker_session` call sites keep
+/// resolving the default target (the newest session) untouched.
 #[derive(Debug, Default)]
 pub struct SessionStore {
     entries: RwLock<HashMap<(String, String), SessionEntry>>,
@@ -82,22 +94,26 @@ impl SessionStore {
         self.default_symbols.read().clone().unwrap_or_default()
     }
 
+    /// A new entry's streaming: its own runtime instance (D-S2).
+    fn new_entry(&self, session: BrokerSession) -> SessionEntry {
+        SessionEntry {
+            session,
+            symbols: self.entry_symbols(),
+            runtime: Arc::new(BrokerRuntime::new()),
+        }
+    }
+
     /// Record a session for its (broker, account), replacing any earlier
     /// one of the same pair; a re-sign-in of the pair keeps the master the
-    /// entry already holds.
+    /// entry already holds (and its runtime: the activation tears down the
+    /// pair's earlier streaming first).
     pub fn upsert(&self, session: BrokerSession) {
         let mut entries = self.entries.write();
         let key = (session.broker_id.clone(), session.account_id.clone());
         match entries.get_mut(&key) {
             Some(e) => e.session = session,
             None => {
-                entries.insert(
-                    key,
-                    SessionEntry {
-                        session,
-                        symbols: self.entry_symbols(),
-                    },
-                );
+                entries.insert(key, self.new_entry(session));
             }
         }
     }
@@ -117,6 +133,50 @@ impl SessionStore {
             .read()
             .get(&(broker.to_string(), account.to_string()))
             .map(|e| e.symbols.clone())
+    }
+
+    /// The streaming of one (broker, account) entry, if live.
+    pub fn runtime_for(&self, broker: &str, account: &str) -> Option<Arc<BrokerRuntime>> {
+        self.entries
+            .read()
+            .get(&(broker.to_string(), account.to_string()))
+            .map(|e| e.runtime.clone())
+    }
+
+    /// Whether one (broker, account) entry is the newest session — the
+    /// default target (D-S4) whose feed the shared market socket serves.
+    pub fn is_newest(&self, broker: &str, account: &str) -> bool {
+        let entries = self.entries.read();
+        let key = (broker.to_string(), account.to_string());
+        let Some(me) = entries.get(&key) else {
+            return false;
+        };
+        entries
+            .values()
+            .all(|e| e.session.authenticated_at <= me.session.authenticated_at)
+    }
+
+    /// Every live entry (a copy: the caller may hold it across awaits).
+    pub fn entries(&self) -> Vec<SessionEntry> {
+        self.entries.read().values().cloned().collect()
+    }
+
+    /// The newest live entry, whatever its age. The first in iteration
+    /// order among equal timestamps, as `list()` resolves it, so the
+    /// default never depends on which resolver read it.
+    pub fn newest_entry(&self) -> Option<SessionEntry> {
+        self.entries
+            .read()
+            .values()
+            .min_by(|a, b| b.session.authenticated_at.cmp(&a.session.authenticated_at))
+            .cloned()
+    }
+
+    /// Remove the entry of one (broker, account), with its streaming handle.
+    pub fn take_entry(&self, broker: &str, account: &str) -> Option<SessionEntry> {
+        self.entries
+            .write()
+            .remove(&(broker.to_string(), account.to_string()))
     }
 
     /// Remove the session of one (broker, account).
@@ -172,17 +232,13 @@ impl SessionStore {
     /// Replace whatever is live with this one session (the
     /// single-session `set_broker_session` contract: the last set wins,
     /// whatever its timestamp). The entry takes the store's default master
-    /// handle; the multi-session core installs a second session with
-    /// `upsert` without ending the first.
+    /// handle; `upsert` installs a second session without ending the first.
     pub fn replace(&self, session: BrokerSession) {
         let mut entries = self.entries.write();
         entries.clear();
         entries.insert(
             (session.broker_id.clone(), session.account_id.clone()),
-            SessionEntry {
-                session,
-                symbols: self.entry_symbols(),
-            },
+            self.new_entry(session),
         );
     }
 
@@ -231,16 +287,19 @@ pub struct AppState {
     pub session_account: crate::services::session_account::AccountCache,
     /// The live broker sessions, keyed by (broker, account) (D3).
     pub broker_sessions: Arc<SessionStore>,
+    /// Master contract download claims (one per broker, global: a second
+    /// account of the same broker must not run a second download of it).
+    pub claims: DownloadClaims,
     /// A broker session ended in memory whose stored row is still to be
     /// revoked (the database write failed), and which rows (every one, or
     /// the daily boundary's). While set, no stored session is resumed; the
     /// session poll and the next sign-in finish the revoke
     /// (`BrokerAuthService::retry_pending_revoke`).
     pub revoke_pending: Mutex<Option<crate::services::broker_auth_service::PendingRevoke>>,
-    /// One broker is logged in at a time. Completing a sign-in (which ends
-    /// any other broker's session first), resuming one, ending one and
-    /// forgetting the logged-in broker run under this lock, so two of them
-    /// never interleave (`BrokerAuthService::session_lock`).
+    /// Every broker-session hand-over — completing a sign-in, resuming one,
+    /// ending one broker's session or all of them, forgetting the keys —
+    /// runs under this lock, so two of them never interleave
+    /// (`BrokerAuthService::session_lock`).
     pub session_switch: tokio::sync::Mutex<()>,
     /// What still depends on the logged-in broker's Live session, asked
     /// before any switch ends it (`services::broker_switch`).
@@ -249,10 +308,11 @@ pub struct AppState {
     /// State of the 8765 market data listener (written by `FeedService`),
     /// shown with the fix when its port is taken.
     pub feed_status: RwLock<ServerStatus>,
+    /// The shared deeper-book socket: the current default session's depth
+    /// feed lives here (D-S2), as the market feed lives on `websocket`.
+    pub depth_ws: Arc<WebSocketManager>,
     /// The feed server's source over the broker managers.
     pub bridge: Arc<crate::feed::bridge::BrokerBridge>,
-    /// Broker session streaming: master contract, feeds, order updates.
-    pub runtime: crate::services::broker_runtime::BrokerRuntime,
     me: std::sync::Weak<AppState>,
     /// Shared outbound HTTP client (explicit timeouts) for non-broker calls.
     pub http: reqwest::Client,
@@ -400,7 +460,7 @@ struct Parts<'a> {
     symbols: SymbolResolver,
     freeze: crate::services::freeze_qty_service::FreezeLimits,
     websocket: Arc<WebSocketManager>,
-    runtime: crate::services::broker_runtime::BrokerRuntime,
+    depth_ws: Arc<WebSocketManager>,
     bridge: Arc<crate::feed::bridge::BrokerBridge>,
 }
 
@@ -496,10 +556,10 @@ impl AppState {
         let symbols = opts.brokers.symbols();
         let freeze = crate::services::freeze_qty_service::FreezeLimits::loaded(&stores.sqlite);
         let websocket = Arc::new(WebSocketManager::new());
-        let runtime = crate::services::broker_runtime::BrokerRuntime::new();
+        let depth_ws = Arc::new(WebSocketManager::new());
         let bridge = crate::feed::bridge::BrokerBridge::with_depth_manager(
             websocket.clone(),
-            runtime.depth_ws.clone(),
+            depth_ws.clone(),
             symbols.clone(),
         );
         let parts = Parts {
@@ -513,7 +573,7 @@ impl AppState {
             symbols,
             freeze,
             websocket,
-            runtime,
+            depth_ws,
             bridge,
         };
         let ctx = Arc::new_cyclic(|me: &std::sync::Weak<Self>| Self::assemble(me, parts));
@@ -556,7 +616,7 @@ impl AppState {
             symbols,
             freeze,
             websocket,
-            runtime,
+            depth_ws,
             bridge,
             ..
         } = p;
@@ -581,8 +641,9 @@ impl AppState {
             freeze,
             brokers: opts.brokers,
             websocket,
+            depth_ws,
             bridge,
-            runtime,
+            claims: DownloadClaims::default(),
             me: me.clone(),
             bus,
             ui,
@@ -665,8 +726,9 @@ impl AppState {
                     crate::services::health_service::scalping_alert(&ctx, message);
                 }
             }));
-        ctx.reconciler
-            .watch_feed(ctx.runtime.order_ws.watch_status());
+        // Every live entry's order feed is watched when its session starts
+        // (`BrokerRuntime::activate`); the shared market feed is watched
+        // once here (D-S2).
         ctx.reconciler.watch_feed(ctx.websocket.watch_status());
         crate::services::order_reconciler::register(&ctx.bus, &ctx.reconciler);
         ctx.reconciler.start();
@@ -747,7 +809,18 @@ impl AppState {
         self.scalping.shutdown().await;
         self.chartink.shutdown().await;
         self.historify.shutdown().await;
-        self.runtime.teardown(self).await;
+        // Every live session's streaming (the newest entry's teardown also
+        // owns the shared market and depth sockets; the others are taken
+        // down on their own, then the shared ones are closed once).
+        for e in self.broker_sessions.entries() {
+            let is_default = self
+                .broker_sessions
+                .is_newest(&e.session.broker_id, &e.session.account_id);
+            e.runtime.teardown(self, is_default).await;
+        }
+        let _ = self.websocket.disconnect().await;
+        let _ = self.depth_ws.disconnect().await;
+        self.bridge.reset();
         self.sandbox.shutdown().await;
         self.bus.shutdown(Duration::from_secs(2)).await;
         // The monitor's writer saves what was queued when shutdown began.
@@ -867,6 +940,23 @@ impl AppState {
     /// per-session target of the master contract service (D-S2).
     pub fn symbols_for(&self, broker: &str, account: &str) -> Option<SymbolResolver> {
         self.broker_sessions.symbols_for(broker, account)
+    }
+
+    /// The streaming of one (broker, account) entry, if live (D-S2).
+    pub fn runtime_for(&self, broker: &str, account: &str) -> Option<Arc<BrokerRuntime>> {
+        self.broker_sessions.runtime_for(broker, account)
+    }
+
+    /// The default target's streaming (the newest session), if any live
+    /// entry runs one: the entry the shared market feed and the reconciler
+    /// follow (D-S2/D-S4).
+    pub fn default_runtime(&self) -> Option<Arc<BrokerRuntime>> {
+        self.broker_sessions.newest_entry().map(|e| e.runtime)
+    }
+
+    /// Whether one (broker, account) session is the default target (D-S4).
+    pub fn is_default_session(&self, broker: &str, account: &str) -> bool {
+        self.broker_sessions.is_newest(broker, account)
     }
 
     /// The signed-in OpenAlgo user, if any (single-user app).

@@ -20,34 +20,34 @@ use crate::state::AppState;
 use crate::websocket::{Reader, SinceConnect, WebSocketManager};
 use serde_json::{json, Map, Value};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
-/// The broker feeds health reports: the market data feed always; the order
-/// update socket (other brokers relay order updates on the market feed or
-/// have the order book read) and the deeper-book socket (Fyers 50, Dhan
-/// 20; the bridge relays it to apps on the feed like the market feed)
-/// while they run, or once a reader skipped any of their updates, so that
-/// stays listed after the socket stops.
-fn feeds(ctx: &AppState) -> Vec<(&'static str, &WebSocketManager)> {
-    listed(
-        ctx.websocket.as_ref(),
-        ctx.runtime.order_ws.as_ref(),
-        ctx.runtime.depth_ws.as_ref(),
-    )
+/// The broker feeds health reports: the market data feed always (the
+/// default session's, D-S2); the order update socket (other brokers relay
+/// order updates on the market feed or have the order book read) and the
+/// deeper-book socket (Fyers 50, Dhan 20; the bridge relays it to apps on
+/// the feed like the market feed) while they run, or once a reader skipped
+/// any of their updates, so that stays listed after the socket stops.
+fn feeds(ctx: &AppState) -> Vec<(&'static str, Arc<WebSocketManager>)> {
+    let order = ctx.default_runtime().map(|rt| rt.order_ws.clone());
+    listed(ctx.websocket.clone(), order, ctx.depth_ws.clone())
 }
 
 /// The market data feed, then the order update and market depth sockets
-/// that run or skipped, each under the name health reports it by.
-fn listed<'a>(
-    market_data: &'a WebSocketManager,
-    order_updates: &'a WebSocketManager,
-    market_depth: &'a WebSocketManager,
-) -> Vec<(&'static str, &'a WebSocketManager)> {
+/// that run or skipped, each under the name health reports it by. The
+/// order socket is the default entry's own (D-S2), when one runs.
+fn listed(
+    market_data: Arc<WebSocketManager>,
+    order_updates: Option<Arc<WebSocketManager>>,
+    market_depth: Arc<WebSocketManager>,
+) -> Vec<(&'static str, Arc<WebSocketManager>)> {
     let mut out = vec![("market_data", market_data)];
     for (name, feed) in [
         ("order_updates", order_updates),
-        ("market_depth", market_depth),
+        ("market_depth", Some(market_depth)),
     ] {
+        let Some(feed) = feed else { continue };
         if feed.is_running() || total(&feed.stats().skipped_since_start()) > 0 {
             out.push((name, feed));
         }
@@ -273,17 +273,20 @@ mod tests {
     #[test]
     fn a_depth_feed_that_skipped_is_listed() {
         let (market, orders, depth) = (
-            WebSocketManager::new(),
-            WebSocketManager::new(),
-            WebSocketManager::new(),
+            Arc::new(WebSocketManager::new()),
+            Arc::new(WebSocketManager::new()),
+            Arc::new(WebSocketManager::new()),
         );
-        let names = |l: &[(&'static str, &WebSocketManager)]| -> Vec<&'static str> {
+        let names = |l: &[(&'static str, Arc<WebSocketManager>)]| -> Vec<&'static str> {
             l.iter().map(|(n, _)| *n).collect()
         };
-        assert_eq!(names(&listed(&market, &orders, &depth)), ["market_data"]);
+        assert_eq!(
+            names(&listed(market.clone(), Some(orders.clone()), depth.clone())),
+            ["market_data"]
+        );
 
         depth.stats().note_skipped(Reader::FeedClients, 4);
-        let feeds = listed(&market, &orders, &depth);
+        let feeds = listed(market, Some(orders), depth);
         assert_eq!(names(&feeds), ["market_data", "market_depth"]);
         let v = block(
             feeds.iter().map(|(n, f)| feed_json(n, f)).collect(),

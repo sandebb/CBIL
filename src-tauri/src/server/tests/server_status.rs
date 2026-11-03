@@ -64,5 +64,4 @@ async fn server_status_shows_each_part_with_its_real_state() {
     for web_only in ["flask", "zmq", "5555"] {
         assert!(!text.contains(web_only), "{}", web_only);
     }
-    h.ctx().runtime.teardown(h.ctx()).await;
 }

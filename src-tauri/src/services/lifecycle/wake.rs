@@ -90,8 +90,11 @@ pub async fn woke(ctx: &AppState, slept: Duration) {
         slept.as_secs().div_ceil(60)
     );
     ctx.websocket.reconnect();
-    ctx.runtime.order_ws.reconnect();
-    ctx.runtime.depth_ws.reconnect();
+    ctx.depth_ws.reconnect();
+    // Every live entry's order socket (D-S2).
+    for e in ctx.broker_sessions.entries() {
+        e.runtime.order_ws.reconnect();
+    }
     ctx.reconciler.request_pass();
     match ctx.sandbox.catch_up().await {
         Ok(Some(r)) if r != Default::default() => {

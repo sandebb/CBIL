@@ -421,13 +421,18 @@ async fn a_failed_or_abandoned_sign_in_to_another_broker_keeps_the_logged_in_one
     );
     assert_eq!(*samco.logouts.lock(), 0);
     assert_eq!(ctx.get_broker_session().unwrap().broker_id, "angel");
-    assert_eq!(ctx.runtime.active_broker().as_deref(), Some("angel"));
+    assert_eq!(
+        ctx.default_runtime()
+            .and_then(|rt| rt.active_broker())
+            .as_deref(),
+        Some("angel")
+    );
     assert_eq!(live_rows(&ctx), vec!["angel".to_string()]);
     // Started and never finished (the trader closed the broker's page).
     let _ = BrokerAuthService::start_oauth(&ctx, "samco", None).await;
     assert_eq!(ctx.get_broker_session().unwrap().broker_id, "angel");
     assert_eq!(live_rows(&ctx), vec!["angel".to_string()]);
-    ctx.runtime.teardown(&ctx).await;
+    ctx.default_runtime().unwrap().teardown(&ctx, true).await;
 }
 
 /// FLOW-04: a session belongs to the keys it signed in with. New keys for
@@ -651,27 +656,56 @@ fn live_rows(ctx: &AppState) -> Vec<String> {
     rows
 }
 
-/// Logging in to Y while X is logged in ends X first: its session, its
-/// streaming and its stored row. X's keys stay saved.
+/// Logging in to Y while X is logged in never ends X (D-S3): X keeps its
+/// session, its streaming and its stored row. Y, the newest, is the
+/// default target. X's keys stay saved.
 #[tokio::test]
-async fn a_sign_in_ends_any_other_brokers_session_first() {
+async fn a_sign_in_keeps_any_other_brokers_session_running() {
     let (t, angel, _samco) = two_brokers();
     let ctx = t.ctx.clone();
     BrokerAuthService::login_with_form(&ctx, "angel", totp())
         .await
         .unwrap();
-    assert_eq!(ctx.runtime.active_broker().as_deref(), Some("angel"));
+    assert_eq!(
+        ctx.default_runtime()
+            .and_then(|rt| rt.active_broker())
+            .as_deref(),
+        Some("angel")
+    );
+    t.clock.set(ist(2026, 10, 5, 10, 30));
     BrokerAuthService::login_with_form(&ctx, "samco", totp())
         .await
         .unwrap();
+    // The newest session is the default target, and the settings name it.
     assert_eq!(ctx.get_broker_session().unwrap().broker_id, "samco");
+    assert_eq!(ctx.server_config().active_broker.as_deref(), Some("samco"));
+    assert_eq!(
+        ctx.default_runtime()
+            .and_then(|rt| rt.active_broker())
+            .as_deref(),
+        Some("samco")
+    );
+    // The earlier session is still live beside it, streaming included.
+    assert_eq!(
+        ctx.broker_sessions.len(),
+        2,
+        "angel's session is still live"
+    );
+    assert_eq!(
+        ctx.runtime_for("angel", DEFAULT_ACCOUNT)
+            .and_then(|rt| rt.active_broker()),
+        Some("angel".to_string()),
+        "angel's streaming keeps running"
+    );
     assert_eq!(
         live_rows(&ctx),
-        vec!["samco".to_string()],
-        "angel's row revoked"
+        vec!["angel".to_string(), "samco".to_string()]
     );
-    assert_eq!(ctx.runtime.active_broker().as_deref(), Some("samco"));
-    assert_eq!(*angel.logouts.lock(), 1, "angel's streaming stopped");
+    assert_eq!(
+        *angel.logouts.lock(),
+        0,
+        "angel's streaming was not stopped"
+    );
     let conn = ctx.sqlite.conn().unwrap();
     assert!(
         credentials::load(&conn, &ctx.security, "angel", DEFAULT_ACCOUNT)
@@ -680,10 +714,12 @@ async fn a_sign_in_ends_any_other_brokers_session_first() {
     );
 }
 
-/// Two sign-ins that complete at the same moment never leave two sessions:
-/// memory, the stored rows and streaming agree on exactly one broker.
+/// Two sign-ins that complete at the same moment leave two sessions:
+/// each broker keeps its own entry, its streaming and its stored row;
+/// the newest is the default target (D-S3/D-S4). The tests' clock is
+/// frozen, so the newest is whichever the store resolves — one of the two.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn two_sign_ins_completing_together_leave_one_session() {
+async fn two_sign_ins_completing_together_keep_both_sessions() {
     for _ in 0..10 {
         let (t, angel, samco) = two_brokers();
         let gate = Arc::new(tokio::sync::Barrier::new(2));
@@ -703,11 +739,43 @@ async fn two_sign_ins_completing_together_leave_one_session() {
         ja.await.unwrap().unwrap();
         js.await.unwrap().unwrap();
         let ctx = &t.ctx;
-        let live = ctx.get_broker_session().expect("one session").broker_id;
-        assert_eq!(live_rows(ctx), vec![live.clone()], "one stored session");
-        assert_eq!(ctx.runtime.active_broker(), Some(live.clone()));
-        assert_eq!(ctx.server_config().active_broker, Some(live));
-        ctx.runtime.teardown(ctx).await;
+        // Both sessions are live, each on its own streaming...
+        assert_eq!(ctx.broker_sessions.len(), 2, "both sessions are live");
+        assert_eq!(
+            live_rows(ctx),
+            vec!["angel".to_string(), "samco".to_string()],
+            "both stored rows are kept"
+        );
+        for b in ["angel", "samco"] {
+            assert_eq!(
+                ctx.runtime_for(b, DEFAULT_ACCOUNT)
+                    .and_then(|rt| rt.active_broker()),
+                Some(b.to_string()),
+                "{}'s streaming runs",
+                b
+            );
+        }
+        // ...and the default target is one of them, as are the settings.
+        let live = ctx
+            .get_broker_session()
+            .expect("a default session")
+            .broker_id;
+        assert!(live == "angel" || live == "samco");
+        assert_eq!(
+            ctx.default_runtime().unwrap().active_broker().as_deref(),
+            Some(live.as_str())
+        );
+        assert!(matches!(
+            ctx.server_config().active_broker.as_deref(),
+            Some("angel") | Some("samco")
+        ));
+        // Both end cleanly: the default's teardown owns the shared sockets.
+        for b in ["angel", "samco"] {
+            ctx.runtime_for(b, DEFAULT_ACCOUNT)
+                .unwrap()
+                .teardown(ctx, b == live)
+                .await;
+        }
     }
 }
 
@@ -766,23 +834,20 @@ fn switch_harness() -> (H, String, String) {
     (h, cookie, csrf)
 }
 
-/// Every way a switch could end the logged-in broker's session is refused,
-/// with the same reason, and nothing changes.
+/// Every way a save could end the logged-in broker's session is refused,
+/// with the same reason, and nothing changes. A sign-in to another broker
+/// is not refused: it ends no session, so it joins the store beside the
+/// logged-in one (D-S3) and is covered by its own tests.
 async fn every_switch_is_refused(h: &H, cookie: &str, csrf: &str, says: &[&str]) {
-    // The switch itself: a sign-in to another broker that completes.
-    let e = BrokerAuthService::login_with_form(h.ctx(), "angel", totp())
-        .await
-        .unwrap_err();
-    let why = e.client_message();
+    // The refusal the guard gives for the logged-in broker — the same
+    // string every refusing flow below answers with.
+    let held = BrokerAuthService::session_lock(h.ctx()).await;
+    let why = crate::services::broker_switch::refusal(h.ctx(), "zerodha").unwrap();
+    drop(held);
     for part in says {
         assert!(why.contains(part), "{why}");
     }
     assert!(why.contains("Nothing was changed."), "{why}");
-    assert_eq!(
-        h.ctx().get_broker_session().unwrap().broker_id,
-        "zerodha",
-        "the sign-in stored nothing"
-    );
     let refused = [
         with_session(
             delete("/api/broker/credentials/zerodha?sign_out=true"),
@@ -857,11 +922,12 @@ async fn switch_row1_running_live_automation_refuses_the_switch_and_names_it() {
     .await;
 }
 
-/// The same rule at the server's last line: a sign-in to another broker
-/// that completes while the logged-in one still runs Live automation is
-/// refused, and the logged-in session stays.
+/// The same rule from the other side (D-S3): a completed sign-in to
+/// another broker ends no session — the logged-in one keeps its Live
+/// automation and stays live beside the new one, and the guard is never
+/// asked, because nothing of its is ended.
 #[tokio::test]
-async fn switch_row1_a_completed_sign_in_to_another_broker_is_refused_too() {
+async fn switch_row1_a_completed_sign_in_to_another_broker_ends_nothing() {
     let (t, _angel, _samco) = two_brokers();
     let ctx = t.ctx.clone();
     BrokerAuthService::login_with_form(&ctx, "angel", totp())
@@ -874,18 +940,43 @@ async fn switch_row1_a_completed_sign_in_to_another_broker_is_refused_too() {
             ..Default::default()
         },
     );
-    let e = BrokerAuthService::login_with_form(&ctx, "samco", totp())
+    t.clock.set(ist(2026, 10, 5, 10, 30));
+    BrokerAuthService::login_with_form(&ctx, "samco", totp())
         .await
-        .unwrap_err();
-    assert!(
-        e.client_message()
-            .starts_with("Angel One still has 1 running Live strategy."),
-        "{}",
-        e.client_message()
+        .unwrap();
+    // The new session is the default; the old one is still live beside it,
+    // automation intact, because a sign-in ends nothing.
+    assert_eq!(ctx.get_broker_session().unwrap().broker_id, "samco");
+    assert_eq!(
+        ctx.broker_sessions.len(),
+        2,
+        "angel's session is still live"
     );
-    assert_eq!(ctx.get_broker_session().unwrap().broker_id, "angel");
-    assert_eq!(live_rows(&ctx), vec!["angel".to_string()]);
-    ctx.runtime.teardown(&ctx).await;
+    assert_eq!(
+        ctx.runtime_for("angel", DEFAULT_ACCOUNT)
+            .and_then(|rt| rt.active_broker()),
+        Some("angel".to_string()),
+        "angel's streaming keeps running"
+    );
+    assert_eq!(
+        live_rows(&ctx),
+        vec!["angel".to_string(), "samco".to_string()]
+    );
+    // The guard still refuses an end that would touch angel's session.
+    let held = BrokerAuthService::session_lock(&ctx).await;
+    let why = crate::services::broker_switch::refusal(&ctx, "angel").unwrap();
+    drop(held);
+    assert!(
+        why.contains("Angel One still has 1 running Live strategy."),
+        "{}",
+        why
+    );
+    for b in ["angel", "samco"] {
+        ctx.runtime_for(b, DEFAULT_ACCOUNT)
+            .unwrap()
+            .teardown(&ctx, b == "samco")
+            .await;
+    }
 }
 
 #[tokio::test]
@@ -930,16 +1021,25 @@ async fn switch_row3_exits_still_filling_refuse_the_switch() {
 }
 
 /// Working orders and positions placed by hand do not block: the sign-in
-/// to the next broker completes, the old session ends then, and they stay
-/// at the old broker untouched.
+/// to the next broker completes, the logged-in session stays live beside
+/// it (a sign-in ends nothing, D-S3), and nothing at the old broker is
+/// cancelled or closed.
 #[tokio::test]
 async fn switch_row4_manual_orders_and_positions_stay_and_do_not_block() {
     let (h, _cookie, _csrf) = switch_harness();
     guard(h.ctx(), SwitchBlockers::default());
+    h.t.clock.set(ist(2026, 10, 5, 10, 30));
     BrokerAuthService::login_with_form(h.ctx(), "angel", totp())
         .await
         .unwrap();
     assert_eq!(h.ctx().get_broker_session().unwrap().broker_id, "angel");
+    assert!(
+        h.ctx()
+            .broker_sessions
+            .get("zerodha", DEFAULT_ACCOUNT)
+            .is_some(),
+        "zerodha's session stays in the store beside it"
+    );
     assert!(
         !h.mock.calls().iter().any(|c| matches!(
             c,
@@ -950,38 +1050,72 @@ async fn switch_row4_manual_orders_and_positions_stay_and_do_not_block() {
         )),
         "nothing is cancelled or closed at the old broker"
     );
-    h.ctx().runtime.teardown(h.ctx()).await;
+    for b in ["zerodha", "angel"] {
+        h.ctx()
+            .runtime_for(b, DEFAULT_ACCOUNT)
+            .unwrap()
+            .teardown(h.ctx(), b == "angel")
+            .await;
+    }
 }
 
-/// Sandbox runs are never counted: with analyzer mode on, the switch goes
-/// ahead and analyzer mode stays on for the next broker's quotes.
+/// Sandbox runs are never counted: with analyzer mode on, the sign-in to
+/// the next broker goes ahead, the logged-in session stays live beside it
+/// (D-S3), and analyzer mode stays on for the next broker's quotes.
 #[tokio::test]
 async fn switch_row5_sandbox_runs_do_not_block() {
     let (h, _cookie, _csrf) = switch_harness();
     h.ctx().sqlite.set_analyze_mode(true).unwrap();
     // The outcomes service counts Live items only.
     guard(h.ctx(), SwitchBlockers::default());
+    h.t.clock.set(ist(2026, 10, 5, 10, 30));
     BrokerAuthService::login_with_form(h.ctx(), "angel", totp())
         .await
         .unwrap();
     assert_eq!(h.ctx().get_broker_session().unwrap().broker_id, "angel");
+    assert_eq!(
+        h.ctx().broker_sessions.len(),
+        2,
+        "zerodha's session stays live beside it"
+    );
     assert!(
         h.ctx().sqlite.get_analyze_mode().unwrap(),
         "sandbox mode stays on"
     );
-    h.ctx().runtime.teardown(h.ctx()).await;
+    for b in ["zerodha", "angel"] {
+        h.ctx()
+            .runtime_for(b, DEFAULT_ACCOUNT)
+            .unwrap()
+            .teardown(h.ctx(), b == "angel")
+            .await;
+    }
 }
 
-/// A guard that cannot answer never lets a switch through.
+/// A guard that cannot answer never lets a session end: the save that
+/// would end it is refused, and the session stays.
 #[tokio::test]
 async fn switch_refused_when_the_check_cannot_answer() {
-    let (h, _cookie, _csrf) = switch_harness();
+    let (h, cookie, csrf) = switch_harness();
     *h.ctx().switch_guard.write() = Arc::new(FakeGuard(Err(())));
-    let e = BrokerAuthService::login_with_form(h.ctx(), "angel", totp())
-        .await
-        .unwrap_err();
-    assert!(e.client_message().contains("could not check"));
-    assert_eq!(h.ctx().get_broker_session().unwrap().broker_id, "zerodha");
+    let (s, v) = h
+        .json(with_session(
+            delete("/api/broker/credentials/zerodha?sign_out=true"),
+            &cookie,
+            Some(&csrf),
+        ))
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{}", v);
+    assert!(
+        v["message"].as_str().unwrap().contains("could not check"),
+        "{}",
+        v
+    );
+    assert!(h.ctx().is_broker_connected(), "the session stays");
+    h.ctx()
+        .default_runtime()
+        .unwrap()
+        .teardown(h.ctx(), true)
+        .await;
 }
 
 // ------------------------------------------------ review follow-ups

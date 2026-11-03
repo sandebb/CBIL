@@ -477,7 +477,10 @@ impl Rig {
         sign_in(&ctx).await;
         until_long("the master contract", || ctx.symbol_count() == o.symbols).await;
         until_long("the market feed", || ctx.websocket.is_connected()).await;
-        until_long("the order socket", || ctx.runtime.order_ws.is_connected()).await;
+        until_long("the order socket", || {
+            ctx.default_runtime().unwrap().order_ws.is_connected()
+        })
+        .await;
 
         Rig {
             base: format!("http://{}", server.addr),

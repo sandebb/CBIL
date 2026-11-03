@@ -182,13 +182,23 @@ pub fn revoke(conn: &Connection, broker_id: &str, account_id: &str) -> Result<()
     Ok(())
 }
 
-pub fn revoke_all(conn: &Connection) -> Result<usize> {
-    Ok(conn.execute(
-        "UPDATE auth SET is_revoked = 1, auth_token_encrypted = '', auth_token_nonce = '',
-            feed_token_encrypted = NULL, feed_token_nonce = NULL, updated_at = datetime('now')
-         WHERE is_revoked = 0",
-        [],
-    )?)
+/// Revoke every stored session except the (broker, account) pairs in
+/// `live` — sessions running in memory meanwhile (a failed revoke's retry
+/// must never reach a row whose session signed in beside the one that
+/// logged out, MULTI_BROKER_PLAN D-S3). Returns how many were revoked.
+pub fn revoke_all_except(conn: &Connection, live: &[(String, String)]) -> Result<usize> {
+    let rows: Vec<(String, String)> = conn
+        .prepare("SELECT broker_id, account_id FROM auth WHERE is_revoked = 0")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    let mut n = 0;
+    for (broker, account) in rows {
+        if !live.iter().any(|(b, a)| b == &broker && a == &account) {
+            revoke(conn, &broker, &account)?;
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// Revoke the stored sessions authenticated before `boundary` (the daily

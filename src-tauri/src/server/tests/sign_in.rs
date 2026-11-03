@@ -318,7 +318,6 @@ async fn every_broker_signs_in_the_way_the_server_tells_the_broker_page() {
         seen.values().map(Vec::len).sum::<usize>(),
         catalog::ALL_BROKERS.len()
     );
-    ctx.runtime.teardown(ctx).await;
 }
 
 fn pending(ctx: &AppState) -> i64 {
@@ -412,5 +411,4 @@ async fn a_bare_callback_starts_a_sign_in_only_from_inside_openalgo() {
             .count(),
         4
     );
-    ctx.runtime.teardown(ctx).await;
 }

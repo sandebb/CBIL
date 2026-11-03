@@ -16,9 +16,11 @@ pub(super) fn checks(ctx: &AppState) -> Vec<Value> {
         return Vec::new();
     }
     let mut out = vec![check("Market data from the broker", &ctx.websocket, true)];
-    let orders = &ctx.runtime.order_ws;
-    if orders.is_running() {
-        out.push(check("Order updates from the broker", orders, false));
+    if let Some(runtime) = ctx.default_runtime() {
+        let orders = runtime.order_ws.as_ref();
+        if orders.is_running() {
+            out.push(check("Order updates from the broker", orders, false));
+        }
     }
     out
 }

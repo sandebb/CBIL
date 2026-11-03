@@ -166,7 +166,13 @@ async fn a_samco_fill_reaches_the_bus_the_page_the_stream_and_the_reconciler() {
         authenticated_at: ctx.now(),
     };
     ctx.set_broker_session(Some(session.clone()));
-    ctx.runtime.activate(&ctx, &session).await;
+    ctx.runtime_for(
+        "samco",
+        openalgo_desktop_lib::security::crypto::DEFAULT_ACCOUNT,
+    )
+    .unwrap()
+    .activate(&ctx, &session, true)
+    .await;
     // The first poll reads the book as it stands and publishes nothing.
     assert!(
         eventually(WAIT, || !fake.calls("/order/orderBook").is_empty()).await,
@@ -221,7 +227,10 @@ async fn a_samco_fill_reaches_the_bus_the_page_the_stream_and_the_reconciler() {
         .await
         .unwrap();
     assert!(!adapter.order_updates_running());
-    assert_eq!(ctx.runtime.task_count(), 0);
+    assert!(
+        ctx.default_runtime().is_none(),
+        "the session's entry is gone"
+    );
 
     drop(client);
     feed.stop().await;

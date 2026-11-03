@@ -1,7 +1,7 @@
-//! Whether the logged-in broker's session may end for a switch (roadmap
-//! "Broker switching: enforcement, not only confirmation"; LOG-07).
+//! Whether a broker's live session may end (roadmap "Broker switching:
+//! enforcement, not only confirmation"; LOG-07).
 //!
-//! | On the logged-in broker A | Switching to B |
+//! | On the broker A whose session would end | Ending it |
 //! | --- | --- |
 //! | Running Live strategies, OpenScript runs or scalping protection | refused until they are stopped; the message names them |
 //! | Placements whose outcome is not yet known (LOG-08) | refused until reconciled |
@@ -11,11 +11,13 @@
 //!
 //! The counts come from the order-outcomes service through [`SwitchGuard`],
 //! so this module never reads another module's tables. Every way a broker
-//! session ends for another broker asks it first: a completed sign-in to
-//! another broker (the switch itself: the old session ends only then),
-//! the web-shaped settings save that switches, forgetting the logged-in
-//! broker and new keys for it. Signing out of OpenAlgo and the daily
-//! boundary are not switches.
+//! session is ENDED asks it first: the web-shaped settings save that makes
+//! another broker the active one, new keys for the logged-in broker and
+//! forgetting it (all of them end that broker's session, and only it —
+//! D-S3). A completed sign-in to another broker is not an end: several
+//! brokers are live at once and the new one joins the store beside the
+//! others, so it never asks this guard. Signing out of OpenAlgo and the
+//! daily boundary end sessions without a switch, and neither asks it.
 
 use crate::error::Result;
 use crate::state::AppState;

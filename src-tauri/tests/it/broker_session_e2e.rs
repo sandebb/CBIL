@@ -292,7 +292,10 @@ async fn login_streams_and_logout_tears_everything_down() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let (fds_before, pool_before) = settled_fds(&ctx).await;
     let app_tasks_before = ctx.task_count();
-    assert_eq!(ctx.runtime.task_count(), 0);
+    assert!(
+        ctx.default_runtime().is_none(),
+        "no broker session before sign-in"
+    );
 
     // ---- sign in: the OAuth callback with the server-issued state ----
     let url = BrokerAuthService::start_oauth(&ctx, "zerodha", Some("browser-session"))
@@ -312,7 +315,10 @@ async fn login_streams_and_logout_tears_everything_down() {
     .await
     .unwrap();
     assert_eq!(session.broker_id, "zerodha");
-    assert_eq!(ctx.runtime.active_broker().as_deref(), Some("zerodha"));
+    assert_eq!(
+        ctx.default_runtime().unwrap().active_broker().as_deref(),
+        Some("zerodha")
+    );
     // The sign-in reloaded the settings; the pinned feed port held.
     assert_eq!(
         Some(ctx.server_config().ws_port),
@@ -378,7 +384,10 @@ async fn login_streams_and_logout_tears_everything_down() {
         .request(json!({"action": "subscribe_orders", "request_id": "o1"}))
         .await;
     assert_eq!(v["status"], "success", "{}", v);
-    until("the order socket", || ctx.runtime.order_ws.is_connected()).await;
+    until("the order socket", || {
+        ctx.default_runtime().unwrap().order_ws.is_connected()
+    })
+    .await;
     order_go.notify_one();
     let frame = loop {
         let v = client.recv().await;
@@ -408,23 +417,31 @@ async fn login_streams_and_logout_tears_everything_down() {
     let push = &pushes.named("order_update")[0];
     assert_eq!(push["orderid"], "251003000123");
     assert_eq!(push["mode"], "live");
-    assert!(ctx.runtime.task_count() > 0);
+    assert!(ctx.default_runtime().unwrap().task_count() > 0);
+    // The entry's streaming handle, for the second-teardown check below.
+    let rt = ctx.default_runtime().unwrap();
 
     // ---- logout: everything the session ran is gone ----
     BrokerAuthService::revoke(&ctx, SessionEndReason::Logout)
         .await
         .unwrap();
-    assert_eq!(ctx.runtime.task_count(), 0, "session tasks left running");
+    assert!(
+        ctx.default_runtime().is_none(),
+        "session tasks left running"
+    );
     assert_eq!(ctx.task_count(), app_tasks_before);
     assert!(!ctx.websocket.is_running());
-    assert!(!ctx.runtime.order_ws.is_running());
-    assert!(!ctx.runtime.depth_ws.is_running());
+    assert!(
+        ctx.broker_sessions.is_empty(),
+        "the ended session's entry and its order socket are gone"
+    );
+    assert!(!ctx.depth_ws.is_running());
     assert_eq!(ctx.websocket.instrument_count(), 0);
     assert!(ctx.bridge.applied().is_empty());
     assert!(ctx.bridge.applied_deep().is_empty());
     assert_eq!(ctx.symbol_count(), 0);
     assert_eq!(*mock.logouts.lock(), 1);
-    assert!(ctx.runtime.active_broker().is_none());
+    assert!(ctx.default_runtime().is_none());
     assert!(ctx.get_broker_session().is_none());
     // Descriptors back to the baseline: both broker sockets are closed. The
     // only growth allowed is the database pool's, two descriptors for each
@@ -451,7 +468,7 @@ async fn login_streams_and_logout_tears_everything_down() {
         pool_after
     );
     // A second teardown (shutdown after logout) is harmless.
-    ctx.runtime.teardown(&ctx).await;
+    rt.teardown(&ctx, true).await;
     assert_eq!(*mock.logouts.lock(), 1);
 
     drop(client);
@@ -525,7 +542,7 @@ async fn resume_restores_credentials_and_uses_the_stored_master() {
     until("the first download", || ctx.symbol_count() == 1).await;
 
     // The app closes without logging out, and comes back.
-    ctx.runtime.teardown(&ctx).await;
+    ctx.default_runtime().unwrap().teardown(&ctx, true).await;
     ctx.set_broker_session(None);
     ctx.clear_symbol_cache();
     let resumed = BrokerAuthService::try_resume(&ctx).await.unwrap();
@@ -553,5 +570,5 @@ async fn resume_restores_credentials_and_uses_the_stored_master() {
         assert!(row.is_ready);
     }
     ctx.shutdown().await;
-    assert_eq!(ctx.runtime.task_count(), 0);
+    assert_eq!(ctx.default_runtime().unwrap().task_count(), 0);
 }

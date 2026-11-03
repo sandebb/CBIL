@@ -126,9 +126,14 @@ pub async fn download(State(ctx): Ctx, body: Option<axum::Json<Value>>) -> Respo
     };
     let auth = auth_of(&s);
     let task_ctx = Arc::downgrade(&ctx);
+    // The download runs as a task of the default session's streaming (D-S2),
+    // so a teardown of that session aborts it with the rest of its tasks.
+    let Some(runtime) = ctx.default_runtime() else {
+        return no_broker();
+    };
     // The claim travels with the task and is released when it ends, even
     // when the task is aborted before it runs.
-    ctx.runtime.spawn_task(async move {
+    runtime.spawn_task(async move {
         let Some(ctx) = task_ctx.upgrade() else {
             return;
         };
@@ -158,7 +163,7 @@ pub async fn cache_reload(State(ctx): Ctx) -> Response {
     let Some(s) = ctx.get_broker_session() else {
         return no_broker();
     };
-    if ctx.runtime.claims.is_running(&s.broker_id) {
+    if ctx.claims.is_running(&s.broker_id) {
         return json_response(
             StatusCode::CONFLICT,
             json!({"status": "error", "message": BUSY_MESSAGE}),

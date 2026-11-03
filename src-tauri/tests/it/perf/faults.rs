@@ -79,7 +79,14 @@ fn secs(d: Option<Duration>) -> String {
 pub async fn inject(rig: &Rig, fault: Fault, sdk_frames: &std::sync::atomic::AtomicU64) -> Outcome {
     let ctx = &rig.ctx;
     let feed_connects = || ctx.websocket.stats().connects.load(Ordering::SeqCst);
-    let order_connects = || ctx.runtime.order_ws.stats().connects.load(Ordering::SeqCst);
+    let order_connects = || {
+        ctx.default_runtime()
+            .unwrap()
+            .order_ws
+            .stats()
+            .connects
+            .load(Ordering::SeqCst)
+    };
     let gaps_closed = || ctx.reconciler.stats.gaps_closed.load(Ordering::SeqCst);
     let (f0, o0, g0) = (feed_connects(), order_connects(), gaps_closed());
     let t0 = Instant::now();
@@ -109,7 +116,7 @@ pub async fn inject(rig: &Rig, fault: Fault, sdk_frames: &std::sync::atomic::Ato
         Fault::OrderSocketDrop => {
             rig.orders.kick();
             let back = within(t0, RECOVER, || {
-                order_connects() > o0 && ctx.runtime.order_ws.is_connected()
+                order_connects() > o0 && ctx.default_runtime().unwrap().order_ws.is_connected()
             })
             .await;
             let gap = within(t0, RECOVER, || gaps_closed() > g0).await;
