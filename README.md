@@ -1,6 +1,6 @@
 # OpenAlgo Desktop downloads
 
-How many times the files of each [OpenAlgo Desktop](https://github.com/sandebb/CBIL) release were downloaded from GitHub, read on 2026-11-13 (UTC). Updated every 6 hours.
+How many times the files of each [OpenAlgo Desktop](https://github.com/sandebb/CBIL) release were downloaded from GitHub, read on 2026-11-14 (UTC). Updated every 6 hours.
 
 ## Totals
 
